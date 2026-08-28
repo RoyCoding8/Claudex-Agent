@@ -1,0 +1,27 @@
+# Environment (may contain local credentials)
+.env
+
+# Temporary files
+tmp/
+*.tmp
+*.log
+
+# Node modules
+node_modules/
+dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Agent runtime data
+data/agents/
+
+# Spike test artifacts
+spikes/*.jsonl
+spikes/*.txt
+
+# OS
+.DS_Store
+Thumbs.db
