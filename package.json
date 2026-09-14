@@ -4,13 +4,25 @@
   "type": "module",
   "description": "A blocking bridge MCP server that offloads long tasks to a worker model behind any Anthropic-compatible gateway via the Claude Agent SDK. Blocks the tool call until terminal; emits progress so the call survives the stdio idle window.",
   "license": "Apache-2.0",
+  "homepage": "https://github.com/RoyCoding8/Claudex-Agent#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RoyCoding8/Claudex-Agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/RoyCoding8/Claudex-Agent/issues"
+  },
   "keywords": [
     "mcp",
     "model-context-protocol",
     "claude",
+    "claude-agent-sdk",
     "agent",
+    "subagent",
     "delegation",
-    "blocking"
+    "blocking",
+    "gateway",
+    "anthropic"
   ],
   "bin": {
     "cx-agent": "./dist/index.js"

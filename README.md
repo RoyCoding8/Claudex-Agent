@@ -1,19 +1,71 @@
-# Claudex Agent
+<div align="center">
 
-An MCP server that offloads long-running tasks from a main agent session to a worker model behind **any gateway you configure**, then **blocks until the work is done** and pushes the result back as a task notification.
+<img src="assets/banner.svg" alt="cx-agent — blocking delegation bridge for MCP" width="720">
+
+<p>
+  <em>Offload long-running agent work to a worker model behind <strong>any</strong> Anthropic-compatible gateway.<br>
+  Block until it is done, then get the result pushed back as a task notification.</em>
+</p>
+
+<p>
+  <a href="https://m8ven.ai/mcp/roycoding8-claudex-agent-1wg602"><img src="https://m8ven.ai/badge/mcp/roycoding8-claudex-agent-1wg602" alt="M8ven Score"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="Apache-2.0 license"></a>
+  <img src="https://img.shields.io/badge/node-%3E%3D18-5FA04E?style=flat-square&amp;logo=nodedotjs&amp;logoColor=white" alt="Node >= 18">
+  <img src="https://img.shields.io/badge/MCP-stdio%20server-1F2937?style=flat-square" alt="MCP stdio server">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-64748B?style=flat-square" alt="Windows, macOS, Linux">
+</p>
+
+<p>
+  <a href="#quick-start"><b>Quick start</b></a> &nbsp;·&nbsp;
+  <a href="#install-in-your-harness"><b>Install</b></a> &nbsp;·&nbsp;
+  <a href="#configuration"><b>Configuration</b></a> &nbsp;·&nbsp;
+  <a href="#tools"><b>Tools</b></a> &nbsp;·&nbsp;
+  <a href="#architecture"><b>Architecture</b></a> &nbsp;·&nbsp;
+  <a href="#migration-from-v02"><b>Migration</b></a>
+</p>
+
+</div>
+
+---
 
 cx-agent bridges any MCP client with any Anthropic-compatible gateway (LiteLLM, CLIProxyAPI, claude-code-router, or your own local router) so expensive work runs on cheaper models while the main session stays responsive. It uses the same `@anthropic-ai/claude-agent-sdk` engine as Claude Code itself — not a one-shot subprocess — so the worker gets a full resumable agent session with file tools, bash, and nested subagents.
 
 **cx-agent has no built-in knowledge of any specific router product.** It is configured entirely through environment variables: point it at a gateway URL, give it a key and a model, and it runs. Nothing about your gateway is baked into the package.
 
+<details>
+<summary><strong>Table of contents</strong></summary>
+
+- [Why](#why)
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [Install (local development)](#install-local-development)
+- [Install in your harness](#install-in-your-harness)
+- [Providers](#providers)
+- [Configuration](#configuration)
+- [Reasoning](#reasoning)
+- [Tools](#tools)
+- [Structured Errors](#structured-errors)
+- [Credential Isolation](#credential-isolation)
+- [Worker Isolation](#worker-isolation)
+- [Job Metadata](#job-metadata)
+- [Transcript Format](#transcript-format)
+- [Architecture](#architecture)
+- [Migration from v0.2](#migration-from-v02)
+- [Cross-platform](#cross-platform)
+- [Development](#development)
+- [License](#license)
+
+</details>
+
 ## Why
 
 Claude Code subagents are powerful but bill to your Anthropic account. cx-agent lets you:
 
-- **Delegate to cheaper models** — any alias your gateway serves (`"Worker lvl"`) or a concrete model id (`"openai/mimo-v2.5-free"`)
-- **Keep the main session responsive** — clients that support it (Claude Code, ZCode) auto-background the call at ~2 minutes and return the result as a push notification
-- **Isolate credentials** — the worker's gateway token never touches your main session's OAuth
-- **Resume and fork** — continue a completed job's conversation or branch it to a new session
+|  |  |
+|---|---|
+| 💸 **Delegate to cheaper models** — any alias your gateway serves (`"Worker lvl"`) or a concrete model id (`"openai/mimo-v2.5-free"`) | ⚡ **Keep the main session responsive** — supporting clients (Claude Code, ZCode) auto-background the call at ~2 minutes and return the result as a push notification |
+| 🔐 **Isolate credentials** — the worker's gateway token never touches your main session's OAuth | ♻️ **Resume and fork** — continue a completed job's conversation or branch it to a new session |
+| 🧱 **Isolate the worker** — no operator hooks, MCP servers, or settings files load inside a delegated session by default | 🧾 **Audit every job** — append-only JSONL transcript plus a `.meta.json` sidecar per run |
 
 ## Requirements
 
@@ -40,8 +92,8 @@ Or configure the server with environment variables in your MCP client — pick y
 ## Install (local development)
 
 ```bash
-git clone <repo>
-cd cx-agent
+git clone https://github.com/RoyCoding8/Claudex-Agent.git
+cd Claudex-Agent
 npm install
 npm run build
 ```
