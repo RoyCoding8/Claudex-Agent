@@ -14,6 +14,7 @@ import type { InterruptHandle } from "../interrupt.js";
 import { jobStoreDir } from "../paths.js";
 import { configValue } from "../config.js";
 import { resolveContextPolicy } from "./context-policy.js";
+import type { AccessPolicy } from "../access.js";
 
 type PiApi = "anthropic-messages" | "openai-completions" | "openai-responses";
 
@@ -24,6 +25,11 @@ export interface PiRunInput extends EngineInput {
 const PI_APIS = ["anthropic-messages", "openai-completions", "openai-responses"] as const;
 const API_KEY_AUTH_API: PiApi = "anthropic-messages";
 const PROVIDER_ID = "cx-agent";
+
+export function piToolsForAccess(access?: AccessPolicy): string[] {
+  return access?.mode === "read-only" ? ["read"] : ["read", "bash", "edit", "write"];
+}
+
 function isPiApi(value: string): value is PiApi {
   return PI_APIS.some((supported) => supported === value);
 }
@@ -143,7 +149,7 @@ export async function runPi(
       agentDir: tempAgentDir,
       modelRuntime,
       model,
-      tools: ["read", "bash", "edit", "write"],
+      tools: piToolsForAccess(input.access),
       resourceLoader,
       sessionManager,
       settingsManager,

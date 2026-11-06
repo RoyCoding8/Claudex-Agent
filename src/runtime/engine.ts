@@ -1,13 +1,14 @@
 import { configValue } from "../config.js";
 import { CONTEXT_CONTROLS } from "./context-policy.js";
+import { RequestError } from "../errors.js";
 
 export const ENGINE_NAMES = ["claude", "codex", "pi"] as const;
 export type EngineName = (typeof ENGINE_NAMES)[number];
 
 export const ENGINE_CAPABILITIES = {
-  claude: { resume: true, fork: true, compact: false, auto_compact: true, context: CONTEXT_CONTROLS.claude },
-  codex: { resume: true, fork: false, compact: false, auto_compact: true, context: CONTEXT_CONTROLS.codex },
-  pi: { resume: true, fork: true, compact: true, auto_compact: true, context: CONTEXT_CONTROLS.pi },
+  claude: { resume: true, fork: true, compact: false, auto_compact: true, context: CONTEXT_CONTROLS.claude, read_only: "tool-allowlist" },
+  codex: { resume: true, fork: false, compact: false, auto_compact: true, context: CONTEXT_CONTROLS.codex, read_only: "native-sandbox" },
+  pi: { resume: true, fork: true, compact: true, auto_compact: true, context: CONTEXT_CONTROLS.pi, read_only: "tool-allowlist" },
 } as const;
 
 export type WorkerEvent =
@@ -35,6 +36,7 @@ export interface EngineInput {
   timeoutMs: number;
   connection?: import("../providers/types.js").Connection;
   context?: import("./context-policy.js").ContextPolicy;
+  access?: import("../access.js").AccessPolicy;
 }
 
 export interface EngineRunContext {
@@ -86,7 +88,9 @@ export function resolveEngine(input: unknown, environment = process.env, configu
   return engine;
 }
 
-export function assertEngineOptionsSupported(engine: Exclude<EngineName, "claude">, input: EngineInput): void {
+export function assertEngineOptionsSupported(engine: Exclude<EngineName, "claude">, input: Pick<EngineInput,
+  "agent" | "maxTurns" | "maxBudgetUsd" | "autoContinue" | "allowedTools" | "disallowedTools" | "thinking" | "effort"
+>): void {
   const unsupported: string[] = [];
   if (input.agent) unsupported.push("agent");
   if (input.maxTurns != null) unsupported.push("max_turns");
@@ -97,6 +101,8 @@ export function assertEngineOptionsSupported(engine: Exclude<EngineName, "claude
   if (input.thinking != null) unsupported.push("thinking");
   if (engine === "pi" && input.effort != null) unsupported.push("effort");
   if (unsupported.length > 0) {
-    throw new Error(engine + " does not support these Claude-specific options: " + unsupported.join(", ") + ".");
+    throw new RequestError("UNSUPPORTED_OPERATION", engine + " does not support these Claude-specific options: " + unsupported.join(", ")
+      + ". Use timeout_ms for a wall-clock limit; use claude for turn/cost budgets and tool menus."
+      + (engine === "pi" && input.effort != null ? " Omit effort for Pi." : ""));
   }
 }

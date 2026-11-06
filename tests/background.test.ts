@@ -113,7 +113,7 @@ describe("background job ownership", () => {
       worker.finish("wire result");
       const result = await client.callTool({ name: "cx_agent_wait", arguments: { job_id: started.job_id, timeout_ms: 100 } });
       const terminal = result.content.find((item) => item.type === "text");
-      expect(terminal?.type === "text" && JSON.parse(terminal.text)).toEqual({ job_id: started.job_id, result: "wire result" });
+      expect(terminal?.type === "text" && JSON.parse(terminal.text)).toMatchObject({ job_id: started.job_id, result: "wire result", output: { outcome: "completed" } });
     } finally { worker.finish(); await client.close(); await server.close(); }
   });
 
@@ -204,7 +204,7 @@ describe("background job ownership", () => {
     const { jobId } = store.start({ prompt: "work" });
     worker.finish("at the deadline");
     const out = await handleWait({ job_id: jobId, timeout_ms: 0 }, store);
-    expect(JSON.parse(out.content.text)).toEqual({ job_id: jobId, result: "at the deadline" });
+    expect(JSON.parse(out.content.text)).toMatchObject({ job_id: jobId, result: "at the deadline", output: { outcome: "completed" } });
   });
 
   it("reports a persistence failure instead of successful durable completion", async () => {
@@ -235,7 +235,7 @@ describe("background job ownership", () => {
     const store = new SessionStore({ runWorker: worker.run, transcriptRoot: root });
     let first = "";
     for (let i = 0; i < 140; i += 1) {
-      const { jobId } = store.start({ prompt: "work" });
+      const { jobId } = store.start({ prompt: "work", cwd: root });
       first ||= jobId;
       worker.finish("persisted result");
       await store.waitFor(jobId, 100);

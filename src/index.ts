@@ -4,7 +4,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { fileURLToPath } from "node:url";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import {
   handleRun, handleList, handleFetchJob, handleInterrupt,
   handleReply, handleCheck, handleSession, handleSetup, handleWait, handleCompact,
@@ -15,18 +15,23 @@ import {
 import { runWorker } from "./worker.js";
 import { loadSettings, transcriptDir, migrateDataOnce, CX_AGENT_VERSION } from "./settings.js";
 import { SessionStore } from "./session-store.js";
+import { observeCompletions, type CompletionNotice } from "./completion.js";
+import { GroupCoordinator } from "./group-coordinator.js";
+import { groupInputSchema, handleGroup } from "./group-tools.js";
 
 export interface ServerOptions {
   name?: string;
   version?: string;
   runWorker?: typeof runWorker;
   store?: SessionStore;
+  enqueueParentContinuation?: (notice: CompletionNotice) => void | Promise<void>;
 }
 
 export function createServer(opts: ServerOptions = {}): {
   server: McpServer;
   registry: InterruptRegistry;
   store: SessionStore;
+  groups: GroupCoordinator;
   connect: () => Promise<void>;
 } {
   const defaults = loadSettings();
@@ -35,11 +40,21 @@ export function createServer(opts: ServerOptions = {}): {
   const run = opts.runWorker ?? runWorker;
   const transcriptRoot = transcriptDir();
   const store = opts.store ?? new SessionStore({ runWorker: run, defaults, transcriptRoot });
+  const groups = new GroupCoordinator(store, { root: join(transcriptRoot, "groups") });
+  const stopCompletion = opts.enqueueParentContinuation
+    ? observeCompletions(store, opts.enqueueParentContinuation, () => console.error("[cx-agent] host completion adapter failed; use persisted results or group wait_any"))
+    : () => {};
 
   const server = new McpServer(
     { name: opts.name ?? "cx-agent", version: opts.version ?? CX_AGENT_VERSION },
     { capabilities: { tools: {} } },
   );
+  server.server.onclose = () => { groups.close(); stopCompletion(); };
+
+  server.registerTool("cx_agent_group", {
+    description: "Create named background tasks with depends_on and max_parallel, inspect one compact group status, or wait_any for terminal events after a replayable cursor. Dependencies run automatically after successful prerequisites; failures block downstream tasks. wait_any returns at most 16 unread events and next_cursor. Timeout/abort leaves jobs running. The default stdio host cannot enqueue a parent model turn. Unfinished group work is blocked after server restart, never silently rerun.",
+    inputSchema: groupInputSchema,
+  }, (args, extra) => handleGroup(args, groups, extra.signal));
 
   server.registerTool(
     "cx_agent_run",
@@ -48,7 +63,7 @@ export function createServer(opts: ServerOptions = {}): {
         "Delegate a task to a worker. Use background:true to return {job_id,status:running} immediately, " +
         "then cx_agent_wait for bounded completion checks while other work continues. Without background:true the call " +
         "blocks until terminal; client backgrounding and notifications depend on the client. The worker is " +
-        "isolated from this conversation. Completed jobs return ONLY {job_id, result}; non-completed jobs return " +
+        "isolated from this conversation. Completed jobs return {job_id, result, output}; non-completed jobs return " +
         "{job_id, status, error, resumable} where error is a typed {code, message}. A job that runs out of budget " +
         "(max_turns, max_budget_usd or timeout_ms) ends as status `incomplete` with resumable:true — the work so far is " +
         "kept and cx_agent_reply(job_id, prompt) continues it in the same session. Budget stops are also retried " +
@@ -192,13 +207,13 @@ export function createServer(opts: ServerOptions = {}): {
     "cx_agent_setup",
     {
       description:
-        "Check endpoint readiness before delegating. Returns { ready, engine, capabilities, model, models, diagnostics }. " +
-        "Reports the selected SDK adapter capabilities and checks gateway configuration. Optional engine and model override defaults. " +
-        "Configured endpoints and models still require a live run to validate protocol compatibility.",
+        "Inspect configuration, exact model availability, protocol verification and completion delivery separately. " +
+        "ready is true only after verify:true sends a small streaming protocol request. This does not test SDK tools or resume. " +
+        "The default stdio host cannot automatically resume the parent; use group wait_any or cx_agent_wait.",
       inputSchema: setupInputSchema,
     },
     async (args) => {
-      const out = await handleSetup(args.model, { engine: args.engine });
+      const out = await handleSetup(args.model, { engine: args.engine, verify: args.verify, hostAdapter: !!opts.enqueueParentContinuation });
       return { content: [{ type: "text" as const, text: out.content.text }], isError: out.isError };
     },
   );
@@ -221,7 +236,7 @@ export function createServer(opts: ServerOptions = {}): {
   );
 
   return {
-    server, registry, store,
+    server, registry, store, groups,
     connect: async () => {
       const transport = new StdioServerTransport();
       await server.connect(transport);

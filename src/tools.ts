@@ -9,21 +9,26 @@ import { type JobMeta } from "./transcript.js";
 import { InterruptHandle } from "./interrupt.js";
 import { SessionStore, type PollResult, type SessionStoreInput, type StartHandle } from "./session-store.js";
 import { type ProgressSender } from "./progress.js";
-import { resolveProvider, type ModelProvider, type Catalog } from "./providers/registry.js";
+import { resolveProvider, type ModelProvider } from "./providers/registry.js";
+import { inspectReadiness, type ReadinessResult } from "./readiness.js";
+import { accessPolicySchema } from "./access.js";
+import type { JobOutput } from "./output.js";
+import { completionDelivery } from "./completion.js";
 import { EFFORT_LEVELS, THINKING_DISPLAYS, buildThinkingConfig, isEffortLevel, isThinkingDisplay, parseThinkingSpec } from "./runtime/claude-sdk.js";
-import { structured, withStructured, codeForStatus, type StructuredError } from "./errors.js";
+import { RequestError, structured, withStructured, codeForStatus, type StructuredError } from "./errors.js";
 import { ENGINE_NAMES, ENGINE_CAPABILITIES, parseEngineName, resolveEngine, type EngineName } from "./runtime/engine.js";
-import { contextPolicySchema, parseContextPolicy, ContextPolicyError, resolveContextPolicy, type ContextPolicy } from "./runtime/context-policy.js";
+import { contextPolicySchema, parseContextPolicy, resolveContextPolicy, type ContextPolicy } from "./runtime/context-policy.js";
 
 
 export type SlimResult =
-  | { job_id: string; result: string }
+  | { job_id: string; result: string; output?: JobOutput }
   | {
       job_id: string;
       status: "failed" | "interrupted" | "incomplete";
       error: StructuredError;
       result?: string;
       truncated?: boolean;
+      output?: JobOutput;
       resumable?: boolean;
       resume_with?: string;
     };
@@ -46,7 +51,7 @@ function boundExcerpt(text: string, limit = SLIM_RESULT_EXCERPT, hint = 'use cx_
 
 /** Build cx_agent_run's context-safe terminal envelope. Non-completed terminals get a bounded excerpt. */
 export function toSlimResult(r: WorkerResult): SlimResult {
-  if (r.status === "completed") return { job_id: r.job_id, result: r.result ?? "" };
+  if (r.status === "completed") return { job_id: r.job_id, result: r.result ?? "", ...(r.output ? { output: r.output } : {}) };
   if (r.status === "failed" || r.status === "interrupted" || r.status === "incomplete") {
     const code = codeForStatus(r.status, r.error) as StructuredError;
     // `resumable` is the field that turns a dead-end envelope into an actionable one:
@@ -56,9 +61,9 @@ export function toSlimResult(r: WorkerResult): SlimResult {
       : { resumable: false };
     if (r.result && r.result.length > 0) {
       const { excerpt, truncated } = boundExcerpt(r.result);
-      return { job_id: r.job_id, status: r.status, error: code, result: excerpt, truncated, ...resume };
+      return { job_id: r.job_id, status: r.status, error: code, result: excerpt, truncated, ...resume, ...(r.output ? { output: r.output } : {}) };
     }
-    return { job_id: r.job_id, status: r.status, error: code, ...resume };
+    return { job_id: r.job_id, status: r.status, error: code, ...resume, ...(r.output ? { output: r.output } : {}) };
   }
   return { job_id: r.job_id, status: "failed", error: structured("INTERNAL", "worker returned non-terminal status: running") };
 }
@@ -121,6 +126,8 @@ export const runInputSchema = {
   model: z.string().optional().describe("Model alias or concrete model id served by the configured gateway (default: from settings)."),
   pool: z.string().optional().describe("Deprecated alias for `model`. Use `model` instead."),
   cwd: z.string().optional().describe("Working directory for the worker."),
+  access: accessPolicySchema.optional().describe("read-only restricts worker tools, with native sandboxing on Codex. An optional report_path grants the parent permission to create that new file from the final text. Claude/Pi tool restrictions are not an OS sandbox."),
+  artifact_paths: z.array(z.string().min(1)).max(32).optional().describe("Caller-selected artifact paths to return with existence, size, and hashes up to 8 MiB. Relative to cwd. Does not grant worker write permission."),
   agent: z.string().optional().describe("Nested subagent name to invoke inside the worker."),
   allowed_tools: z.array(z.string()).optional()
     .describe("Restrict the worker's built-in Claude Code tool menu to exactly these names when non-empty (e.g. [\"Read\",\"Bash\"]). Empty/omitted = all tools available."),
@@ -153,6 +160,8 @@ export const replyInputSchema = {
   background: runInputSchema.background,
   engine: runInputSchema.engine.describe("Must match the source job engine. Omitted inherits it. Cross-engine session resume is unsupported."),
   context: runInputSchema.context,
+  access: runInputSchema.access,
+  artifact_paths: runInputSchema.artifact_paths,
   model: z.string().optional().describe("Model alias or concrete model id. Default: INHERITED from the resumed job."),
   pool: z.string().optional().describe("Deprecated alias for `model`."),
   cwd: z.string().optional()
@@ -199,7 +208,10 @@ export const sessionInputSchema = {
   dry_run: z.boolean().optional().describe("clean: list what would be removed without deleting (default false)."),
 };
 
-export const setupInputSchema = { engine: runInputSchema.engine, model: runInputSchema.model };
+export const setupInputSchema = {
+  engine: runInputSchema.engine, model: runInputSchema.model,
+  verify: z.boolean().optional().describe("Send a paid streaming protocol request for this exact model, capped at 512 output tokens and 15 seconds. Without this, ready is false and availability may be unknown. This does not verify SDK tools or resume."),
+};
 
 export const fetchInputSchema = {
   job_id: jobIdSchema.describe("The job_id to fetch details for."),
@@ -207,7 +219,7 @@ export const fetchInputSchema = {
     .array(z.enum([
       "status", "result", "turns", "pool_resolved", "transcript_path", "error",
       "started_at", "ended_at", "cx_agent_version", "usage", "session_id", "files_changed",
-      "resumable", "resumed_from", "continuations", "cwd", "agent", "budget", "reasoning", "engine", "context",
+      "resumable", "resumed_from", "continuations", "cwd", "agent", "budget", "reasoning", "engine", "context", "access", "output",
     ]))
     .optional()
     .describe(
@@ -263,10 +275,13 @@ function trackInterruptableJob(
 }
 
 /** Common tool-args → SessionStoreInput mapping for run and reply. */
-function toStoreInput(args: Record<string, unknown>): Omit<SessionStoreInput, "prompt"> {
+export function toStoreInput(args: Record<string, unknown>): Omit<SessionStoreInput, "prompt"> {
   return {
     engine: parseEngineName(args.engine),
+    background: args.background === true,
     context: parseContextPolicy(args.context),
+    access: args.access === undefined ? undefined : accessPolicySchema.parse(args.access),
+    artifactPaths: Array.isArray(args.artifact_paths) ? args.artifact_paths as string[] : undefined,
     operation: args.operation === "compact" ? "compact" : undefined,
     model: typeof args.model === "string" ? args.model : typeof args.pool === "string" ? args.pool : undefined,
     cwd: typeof args.cwd === "string" ? args.cwd : undefined,
@@ -346,7 +361,7 @@ export async function handleRun(
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return {
-      content: { type: "text", text: JSON.stringify({ job_id: null, status: "failed", error: structured(e instanceof ContextPolicyError ? e.code : "INTERNAL", msg) }) },
+      content: { type: "text", text: JSON.stringify({ job_id: null, status: "failed", error: structured(e instanceof RequestError ? e.code : e instanceof z.ZodError ? "INVALID_ARGUMENT" : "INTERNAL", msg) }) },
       isError: true,
     };
   }
@@ -424,14 +439,14 @@ export async function handleInterrupt(
 export type FetchField =
   | "status" | "result" | "turns" | "pool_resolved"
   | "transcript_path" | "error" | "started_at" | "ended_at" | "cx_agent_version" | "usage" | "session_id" | "files_changed"
-  | "resumable" | "resumed_from" | "continuations" | "cwd" | "agent" | "budget" | "reasoning" | "engine" | "context";
+  | "resumable" | "resumed_from" | "continuations" | "cwd" | "agent" | "budget" | "reasoning" | "engine" | "context" | "access" | "output";
 
 /** Every field handleSession(get) returns — the full sidecar view.
  *  `reasoning` is excluded on purpose: it reads the JSONL and can be large, so it stays opt-in. */
 export const ALL_FETCH_FIELDS: FetchField[] = [
   "status", "result", "turns", "pool_resolved", "transcript_path", "error",
   "started_at", "ended_at", "cx_agent_version", "usage", "session_id", "files_changed",
-  "resumable", "resumed_from", "continuations", "cwd", "agent", "budget", "engine", "context",
+  "resumable", "resumed_from", "continuations", "cwd", "agent", "budget", "engine", "context", "access", "output",
 ];
 
 /** Default fields returned when `fields` is omitted. */
@@ -466,6 +481,8 @@ export function handleFetchJob(
     switch (f) {
       case "engine": out.engine = meta.engine ?? "claude"; break;
       case "context": out.context = meta.context ?? null; break;
+      case "access": out.access = meta.access ?? null; break;
+      case "output": out.output = meta.output ?? null; break;
       case "status": out.status = meta.status; break;
       case "result": {
         if (meta.result === undefined || meta.result === null) {
@@ -613,7 +630,7 @@ export async function handleReply(
     });
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
-    return { content: { type: "text", text: JSON.stringify(withStructured({ job_id: jobId, status: "failed" }, e instanceof ContextPolicyError ? e.code : "INTERNAL", message)) }, isError: true };
+    return { content: { type: "text", text: JSON.stringify(withStructured({ job_id: jobId, status: "failed" }, e instanceof RequestError ? e.code : e instanceof z.ZodError ? "INVALID_ARGUMENT" : "INTERNAL", message)) }, isError: true };
   }
   if ("status" in started) {
     if (started.status === "INVALID_ARGUMENT") return {
@@ -667,7 +684,7 @@ export function handleCheck(
   store: SessionStore,
 ): { content: { type: "text"; text: string }; isError?: boolean } {
   const res: PollResult = store.poll(String(args.job_id ?? ""), typeof args.since_cursor === "number" ? args.since_cursor : 0);
-  return { content: { type: "text", text: JSON.stringify(res) } };
+  return { content: { type: "text", text: JSON.stringify({ ...res, progress: store.progress(res.job_id) }) } };
 }
 
 export interface SessionHandlerDeps {
@@ -737,11 +754,8 @@ function removeJobFiles(root: string, jobId: string): void {
   }
 }
 
-export interface SetupResult {
-  ready: boolean;
-  model: string | null;
-  models: string[];
-  diagnostics: string[];
+export interface SetupResult extends ReadinessResult {
+  completion_delivery?: ReturnType<typeof completionDelivery>;
   engine?: EngineName;
   capabilities?: (typeof ENGINE_CAPABILITIES)[EngineName];
   context?: ContextPolicy | null;
@@ -749,34 +763,26 @@ export interface SetupResult {
 
 export async function handleSetup(
   poolName?: string,
-  opts: { provider?: ModelProvider; engine?: string } = {},
+  opts: { provider?: ModelProvider; engine?: string; verify?: boolean; fetchImpl?: typeof fetch; hostAdapter?: boolean } = {},
 ): Promise<{ content: { type: "text"; text: string }; isError?: boolean }> {
   const settings = loadSettings();
   const model = poolName ?? settings.pool;
-  const diagnostics: string[] = [];
-  let catalog: Catalog;
   let engine: EngineName | undefined;
   try {
     engine = resolveEngine(opts.engine);
     const provider = opts.provider ?? resolveProvider();
-    catalog = await provider.discover(model);
-  } catch (e) {
-    diagnostics.push(e instanceof Error ? e.message : String(e));
-    return setupPayload(false, model ?? null, [], diagnostics, true, engine);
+    const readiness = await inspectReadiness({ provider, model, engine, verify: opts.verify, fetchImpl: opts.fetchImpl });
+    const payload: SetupResult = { ...readiness, engine, capabilities: ENGINE_CAPABILITIES[engine], context: resolveContextPolicy(engine) ?? null, completion_delivery: completionDelivery(opts.hostAdapter) };
+    const isError = readiness.configuration !== "configured" || !model || readiness.availability.status === "unavailable" || (opts.verify === true && !readiness.ready);
+    return { content: { type: "text", text: JSON.stringify(payload) }, isError };
+  } catch {
+    const payload: SetupResult = {
+      ready: false, phase: "configuration", configuration: "invalid", model: model ?? null, models: [],
+      availability: { status: "unknown", source: "unknown" }, protocol: { status: "skipped", api: "unknown" },
+      diagnostics: ["Could not inspect readiness. Check the engine, gateway configuration, and model discovery."],
+      completion_delivery: completionDelivery(opts.hostAdapter),
+      ...(engine ? { engine, capabilities: ENGINE_CAPABILITIES[engine] } : {}),
+    };
+    return { content: { type: "text", text: JSON.stringify(payload) }, isError: true };
   }
-  diagnostics.push(...catalog.diagnostics);
-  if (!model || model.length === 0) {
-    diagnostics.push("no model configured — pass a model name, set CX_AGENT_MODEL, or set agent_defaults.pool in the config file.");
-  } else if (catalog.models.length > 0 && !catalog.models.includes(model)) {
-    diagnostics.push(`unknown model "${model}"; valid models: ${catalog.models.join(", ")}`);
-  }
-  const ready = catalog.ready && !!model && (catalog.models.length === 0 || catalog.models.includes(model));
-  return setupPayload(ready, model ?? null, catalog.models, diagnostics, !ready, engine);
-}
-
-function setupPayload(
-  ready: boolean, model: string | null, models: string[], diagnostics: string[], isError = true, engine?: EngineName,
-): { content: { type: "text"; text: string }; isError?: boolean } {
-  const payload: SetupResult = { ready, model, models, diagnostics, ...(engine ? { engine, capabilities: ENGINE_CAPABILITIES[engine], context: resolveContextPolicy(engine) ?? null } : {}) };
-  return { content: { type: "text", text: JSON.stringify(payload) }, isError };
 }

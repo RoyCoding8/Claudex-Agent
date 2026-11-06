@@ -69,7 +69,7 @@ describe("handleRun", () => {
     const out = await handleRun({ prompt: "x" }, extra("t"), { runWorker: fakeWorker });
     expect(out.isError).toBe(true);
     const parsed = JSON.parse(out.content.text);
-    expect(parsed).toEqual({ job_id: "j1", status: "failed", error: { code: "INTERNAL", message: "boom" }, resumable: false });
+    expect(parsed).toMatchObject({ job_id: "j1", status: "failed", error: { code: "INTERNAL", message: "boom" }, resumable: false, output: { outcome: "failed" } });
         expect(fakeWorker.mock.calls[0][0]).toMatchObject({ prompt: "x", progressToken: "t" });
     expect(typeof fakeWorker.mock.calls[0][0].sendProgress).toBe("function");
   });
@@ -81,7 +81,7 @@ describe("handleRun", () => {
     });
     const out = await handleRun({ prompt: "x" }, extra(), { runWorker: fakeWorker });
     expect(out.isError).toBe(false);
-    expect(JSON.parse(out.content.text)).toEqual({ job_id: "j2", result: "done" });
+    expect(JSON.parse(out.content.text)).toMatchObject({ job_id: "j2", result: "done", output: { outcome: "completed", artifacts: [], unresolved_questions: null } });
   });
 
   it("catches a thrown worker and returns isError (defends the never-throws invariant)", async () => {
@@ -682,6 +682,7 @@ describe("handleSetup — gateway readiness", () => {
       models: over.models ?? ["Worker lvl", "Opus lvl"],
       ready: over.ready ?? true,
       diagnostics: over.diagnostics ?? [],
+      source: "models-endpoint" as const,
     }),
     connection: async (model: string) => ({ baseUrl: "http://g:1", apiKey: "k", model }),
   });
@@ -689,8 +690,10 @@ describe("handleSetup — gateway readiness", () => {
   it("reports endpoint-neutral readiness fields", async () => {
     const out = await handleSetup("Worker lvl", { provider: provider() });
     const parsed = JSON.parse(out.content.text);
-    expect(parsed).toEqual({
-      ready: true, model: "Worker lvl", models: ["Worker lvl", "Opus lvl"], diagnostics: [],
+    expect(parsed).toMatchObject({
+      ready: false, model: "Worker lvl", models: ["Worker lvl", "Opus lvl"], configuration: "configured",
+      availability: { status: "available", source: "models-endpoint" }, protocol: { status: "not-requested" },
+      completion_delivery: { parent_resume: false, mode: "wait-only" },
       engine: "claude", capabilities: { resume: true, fork: true, compact: false, auto_compact: true, context: ["window_tokens", "max_output_tokens", "compaction.enabled"] }, context: null,
     });
     expect(out.isError).toBe(false);
@@ -709,9 +712,8 @@ describe("handleSetup — gateway readiness", () => {
       ...provider(), discover: async () => { throw new Error("gateway offline"); },
     } });
     expect(out.isError).toBe(true);
-    expect(JSON.parse(out.content.text)).toMatchObject({ ready: false, engine: "pi", diagnostics: ["gateway offline"],
+    expect(JSON.parse(out.content.text)).toMatchObject({ ready: false, engine: "pi", configuration: "invalid",
       capabilities: { auto_compact: true, context: ["window_tokens", "max_output_tokens", "compaction.enabled", "compaction.trigger_tokens", "compaction.keep_recent_tokens"] },
-      context: { window_tokens: 128000, max_output_tokens: 8192, compaction: { enabled: true, trigger_tokens: 111616, keep_recent_tokens: 20000 } },
     });
   });
 
@@ -722,7 +724,8 @@ describe("handleSetup — gateway readiness", () => {
       const out = await handleSetup("Worker lvl");
       const parsed = JSON.parse(out.content.text);
       expect(parsed.ready).toBe(false);
-      expect(parsed.diagnostics[0]).toMatch(/removed in v0\.3\.0/);
+      expect(parsed.configuration).toBe("invalid");
+      expect(parsed.diagnostics[0]).toMatch(/engine, gateway configuration/);
       expect(out.isError).toBe(true);
     } finally {
       if (prev === undefined) delete process.env.CX_AGENT_PROVIDER;

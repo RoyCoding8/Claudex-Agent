@@ -7,6 +7,7 @@ import type { Connection } from "../providers/types.js";
 import { InterruptHandle } from "../interrupt.js";
 import type { EngineInput, EngineResult, TokenUsage } from "./engine.js";
 import type { SdkMessageLike } from "../progress.js";
+import { READ_ONLY_TOOLS } from "../access.js";
 
 export const CONTINUE_PROMPT =
   "You stopped because you ran out of turn/cost budget for that round, not because the task was finished. " +
@@ -105,6 +106,8 @@ export async function runClaude(
   input: ClaudeRunInput,
   interrupt: InterruptHandle,
 ): Promise<EngineResult> {
+  const readOnly = input.access?.mode === "read-only";
+  if (readOnly && input.agent) throw new Error("Claude read-only access does not allow agents.");
   const queryFn = input.queryFn ?? query;
   const autoContinue = input.autoContinue ?? input.defaults.autoContinue;
   const env = buildWorkerEnv(input.connection, { gitBashPath: input.defaults.gitBashPath });
@@ -118,18 +121,20 @@ export async function runClaude(
     disallowedTools: [...WORKER_DISALLOWED_TOOLS, ...(input.disallowedTools ?? [])],
     maxTurns: input.maxTurns ?? input.defaults.maxTurns,
     abortController: interrupt.abortController,
-    settingSources: input.defaults.inheritSettings ? ["user", "project", "local"] : [],
-    permissionMode: "bypassPermissions",
-    allowDangerouslySkipPermissions: true,
+    settingSources: readOnly ? [] : input.defaults.inheritSettings ? ["user", "project", "local"] : [],
+    permissionMode: readOnly ? "default" : "bypassPermissions",
+    allowDangerouslySkipPermissions: !readOnly,
     persistSession: true,
     spawnClaudeCodeProcess: makeSpawnWithPid(interrupt),
-    canUseTool: async (_toolName, _toolInput, options) => {
+    canUseTool: async (toolName, toolInput, options) => {
       if (options.signal.aborted) return { behavior: "deny", message: "aborted", interrupt: true };
+      if (readOnly && READ_ONLY_TOOLS.some((tool) => tool === toolName)) return { behavior: "allow", updatedInput: toolInput };
       return { behavior: "deny", message: "permission requests are not interactive in cx-agent; refusing", interrupt: true };
     },
   };
-  if (input.allowedTools?.length) options.tools = input.allowedTools;
-  if (input.agent) options.agent = input.agent;
+  if (readOnly) options.tools = [...READ_ONLY_TOOLS];
+  else if (input.allowedTools?.length) options.tools = input.allowedTools;
+  if (!readOnly && input.agent) options.agent = input.agent;
   if ((input.maxBudgetUsd ?? input.defaults.maxBudgetUsd) > 0) options.maxBudgetUsd = input.maxBudgetUsd ?? input.defaults.maxBudgetUsd;
   if (input.thinking) options.thinking = input.thinking;
   if (input.effort) options.effort = input.effort;

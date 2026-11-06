@@ -7,6 +7,8 @@ import { redactPayload } from "./retention.js";
 import type { EffortLevel } from "./runtime/claude-sdk.js";
 import type { EngineName, TokenUsage } from "./runtime/engine.js";
 import type { ContextPolicy } from "./runtime/context-policy.js";
+import type { AccessPolicy } from "./access.js";
+import type { JobOutput } from "./output.js";
 
 export type RecordKind =
   | "system"
@@ -32,6 +34,8 @@ export interface JobMeta {
   job_id: string;
   engine?: EngineName;
   context?: ContextPolicy;
+  access?: AccessPolicy;
+  output?: JobOutput;
   status: JobStatus;
   pool: string;
   pool_resolved: string[];

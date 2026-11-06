@@ -85,18 +85,18 @@ export class GatewayProvider implements ModelProvider {
     const baseUrl = this.resolveBaseUrl();
     if (!baseUrl) {
       return {
-        models: [], ready: false,
+        models: [], ready: false, source: mode, configuration: "missing",
         diagnostics: ["CX_AGENT_BASE_URL is not set — configure an Anthropic-compatible endpoint, e.g. https://gateway.example.com"],
       };
     }
     if (mode === "static") {
       const models = this.resolveStaticModels();
       return {
-        models, ready: models.length > 0,
+        models, ready: models.length > 0, source: "static", configuration: "configured",
         diagnostics: models.length === 0 ? ["CX_AGENT_MODELS is empty"] : [],
       };
     }
-    if (mode === "none") return { models: [], ready: true, diagnostics: [] };
+    if (mode === "none") return { models: [], ready: true, diagnostics: [], source: "none", configuration: "configured" };
     return this.fetchModels(baseUrl);
   }
 
@@ -112,19 +112,23 @@ export class GatewayProvider implements ModelProvider {
       }
       const resp = await this.fetchImpl()(url, { headers, signal: AbortSignal.timeout(10_000) });
       if (!resp.ok) {
-        return { models: [], ready: false, diagnostics: [`GET ${url} returned ${resp.status}${resp.status === 401 || resp.status === 403 ? " — check CX_AGENT_API_KEY" : ""}`] };
+        return { models: [], ready: false, diagnostics: [`GET /v1/models returned ${resp.status}${resp.status === 401 || resp.status === 403 ? " — check CX_AGENT_API_KEY" : ""}`], source: "models-endpoint", configuration: "configured" };
       }
-      const body = await resp.json() as { data?: Array<{ id?: string }> } | Array<{ id?: string }>;
-      const list = Array.isArray(body) ? body : (body.data ?? []);
-      const models = list.map((m) => m?.id).filter((id): id is string => typeof id === "string").sort();
+      const body: unknown = await resp.json();
+      const list = Array.isArray(body)
+        ? body
+        : typeof body === "object" && body !== null && "data" in body && Array.isArray(body.data) ? body.data : [];
+      const models = list.flatMap((model) =>
+        typeof model === "object" && model !== null && "id" in model && typeof model.id === "string" ? [model.id] : [],
+      ).sort();
       if (models.length === 0) {
-        return { models: [], ready: false, diagnostics: [`GET ${url} returned no models — check the endpoint's model list`] };
+        return { models: [], ready: false, diagnostics: ["GET /v1/models returned no models — check the endpoint's model list"], source: "models-endpoint", configuration: "configured" };
       }
-      return { models, ready: true, diagnostics: [] };
-    } catch (e) {
+      return { models, ready: true, diagnostics: [], source: "models-endpoint", configuration: "configured" };
+    } catch {
       return {
         models: [], ready: false,
-        diagnostics: [`GET ${url} failed: ${(e as Error)?.message ?? String(e)} — is the gateway running?`],
+        diagnostics: ["GET /v1/models failed — is the gateway running?"], source: "models-endpoint", configuration: "configured",
       };
     }
   }

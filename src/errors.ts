@@ -19,6 +19,13 @@ export interface StructuredError {
   message: string;
 }
 
+export class RequestError extends Error {
+  constructor(readonly code: ErrorCode, message: string) {
+    super(message);
+    this.name = "RequestError";
+  }
+}
+
 export type WithError<T extends Record<string, unknown>> = Omit<T, "error"> & {
   error: StructuredError | null;
 };

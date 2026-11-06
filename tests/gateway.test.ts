@@ -65,7 +65,7 @@ describe("GatewayProvider.discover", () => {
     });
     const c = await p.discover();
     expect(c.ready).toBe(false);
-    expect(c.diagnostics[0]).toMatch(/GET http:\/\/g:1\/v1\/models failed: ECONNREFUSED/);
+    expect(c.diagnostics[0]).toMatch(/GET \/v1\/models failed/);
   });
 
   it("models-endpoint: 401 gets a CX_AGENT_API_KEY hint", async () => {
@@ -119,7 +119,7 @@ describe("GatewayProvider.discover", () => {
     process.env.CX_AGENT_BASE_URL = "https://gateway.example.com/anthropic";
     process.env.CX_AGENT_MODEL = "worker-model";
     const p = new GatewayProvider({ fetchImpl: async () => { throw new Error("must not fetch"); } });
-    await expect(p.discover()).resolves.toMatchObject({ ready: true, models: [] });
+    await expect(p.discover()).resolves.toMatchObject({ ready: true, models: [], source: "none" });
   });
 
   it("an explicit per-call model makes discovery optional", async () => {
@@ -127,7 +127,7 @@ describe("GatewayProvider.discover", () => {
       baseUrl: "https://gateway.example.com",
       fetchImpl: async () => { throw new Error("must not fetch"); },
     });
-    await expect(p.discover("worker-model")).resolves.toMatchObject({ ready: true, models: [] });
+    await expect(p.discover("worker-model")).resolves.toMatchObject({ ready: true, models: [], source: "none" });
   });
 
   it("caches discovery for the TTL — two calls, one fetch", async () => {

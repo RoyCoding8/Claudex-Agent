@@ -1,6 +1,6 @@
 // cx-agent SessionStore — seam behind lifecycle tools.
 
-import { type WorkerResult, type WorkerInput, type WorkerDeps, runWorker } from "./worker.js";
+import { type WorkerResult, type WorkerInput, type WorkerDeps, runWorker, assertEngineDefaultsSupported } from "./worker.js";
 import { newJobId, Transcript, type JobMeta, type JobStatus } from "./transcript.js";
 import { InterruptHandle } from "./interrupt.js";
 import { summarizeThinking, type ProgressSender } from "./progress.js";
@@ -9,8 +9,12 @@ import { joinPath, joinFs, jobStoreDir } from "./paths.js";
 import type { SDKMessage, ThinkingConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { EffortLevel } from "./runtime/claude-sdk.js";
 import { redactText } from "./retention.js";
-import { resolveEngine, type EngineName, type WorkerEvent } from "./runtime/engine.js";
+import { resolveEngine, assertEngineOptionsSupported, ENGINE_CAPABILITIES, type EngineName, type WorkerEvent } from "./runtime/engine.js";
 import { resolveContextPolicy, mergeContextPolicy, type ContextPolicy } from "./runtime/context-policy.js";
+import { loadSettings } from "./settings.js";
+import { resolveAccessPolicy, type AccessPolicy } from "./access.js";
+import { collectOutput, publishReport, reportDestination, sourceRevision, pathKey } from "./output.js";
+import { RequestError } from "./errors.js";
 
 const RING_HARD_CAP = 256;
 const SETTLED_JOB_CAP = 128;
@@ -34,12 +38,24 @@ interface LiveJob {
   stopMode: "interrupt" | "cancel" | null;
   sessionId: string | null;
   input: SessionStoreInput;
+  startedAt: string;
+  lastActivityAt: string;
+  currentStep: string;
+}
+
+export interface Settlement {
+  job_id: string;
+  result: WorkerResult;
+  background: boolean;
 }
 
 export interface SessionStoreInput {
   prompt: string;
   engine?: EngineName;
   context?: ContextPolicy;
+  access?: AccessPolicy;
+  artifactPaths?: string[];
+  background?: boolean;
   operation?: "prompt" | "compact";
   model?: string;
   pool?: string;
@@ -149,6 +165,7 @@ function pushEvent(events: RingEvent[], ev: RingEvent): void {
 
 export class SessionStore {
   private readonly live = new Map<string, LiveJob>();
+  private readonly listeners = new Set<(event: Settlement) => void | Promise<void>>();
   private persistenceFault: string | null = null;
   private readonly deps: SessionStoreDeps;
 
@@ -160,18 +177,61 @@ export class SessionStore {
     return this.live.size;
   }
 
+  subscribe(listener: (event: Settlement) => void | Promise<void>): () => void {
+    this.listeners.add(listener);
+    return () => { this.listeners.delete(listener); };
+  }
+
+  progress(jobId: string) {
+    const live = this.live.get(jobId);
+    const meta = this.readMeta(jobId);
+    const started = meta?.started_at ?? live?.startedAt ?? null;
+    const ended = meta?.ended_at ?? (live?.state.kind === "settled" ? live.lastActivityAt : null);
+    return {
+      phase: live?.state.kind === "running" ? "executing" : meta?.status === "running" ? "orphaned" : meta || live ? "terminal" : "unknown",
+      started_at: started,
+      last_activity_at: live?.lastActivityAt ?? ended ?? started,
+      elapsed_ms: started ? Math.max(0, (ended ? Date.parse(ended) : Date.now()) - Date.parse(started)) : 0,
+      current_step: live?.currentStep ?? meta?.status ?? "unknown job",
+    };
+  }
+
   private root(): string {
     return this.deps.transcriptRoot ?? jobStoreDir();
+  }
+
+  prepare(input: SessionStoreInput): SessionStoreInput {
+    const engine = resolveEngine(input.engine);
+    if (input.fork && !ENGINE_CAPABILITIES[engine].fork) throw new RequestError("UNSUPPORTED_OPERATION", `${engine} does not support native session forks.`);
+    if (input.operation === "compact" && !ENGINE_CAPABILITIES[engine].compact) throw new RequestError("UNSUPPORTED_OPERATION", `${engine} does not support manual compaction.`);
+    if (engine !== "claude") {
+      assertEngineOptionsSupported(engine, input);
+      assertEngineDefaultsSupported(engine, this.deps.defaults ?? loadSettings());
+    }
+    const cwd = input.cwd ?? process.cwd();
+    if (input.artifactPaths && (input.artifactPaths.length > 32 || input.artifactPaths.some((path) => typeof path !== "string" || !path.trim()))) {
+      throw new RequestError("INVALID_ARGUMENT", "artifact_paths accepts at most 32 nonempty paths.");
+    }
+    const access = resolveAccessPolicy(engine, input.access, cwd);
+    if (access.mode === "read-only" && input.agent) throw new RequestError("UNSUPPORTED_OPERATION", "Read-only workers cannot invoke nested agents.");
+    if (access.mode === "read-only" && access.report_path) {
+      const path = reportDestination(access.report_path, cwd, this.root());
+      if ([...this.live.values()].some((job) => job.state.kind === "running" && job.input.access?.mode === "read-only" && job.input.access.report_path && pathKey(job.input.access.report_path) === pathKey(path))) {
+        throw new RequestError("INVALID_ARGUMENT", "report_path is already assigned to a running job.");
+      }
+      access.report_path = path;
+    }
+    return { ...input, engine, access, context: resolveContextPolicy(engine, input.context), cwd };
   }
 
   /** Register a job, spawn the worker as a detached promise, return the synchronous handle. */
   start(input: SessionStoreInput): StartHandle {
     if (this.persistenceFault) throw new Error(this.persistenceFault);
-    const engine = resolveEngine(input.engine);
-    input = { ...input, engine, context: resolveContextPolicy(engine, input.context), cwd: input.cwd ?? process.cwd() };
+    input = this.prepare(input);
     const run = this.deps.runWorker ?? runWorker;
     const jobId = newJobId();
     const interrupt = new InterruptHandle();
+    const source = sourceRevision(input.cwd ?? process.cwd());
     const events: RingEvent[] = [];
     let cursorSeq = 0;
     let sessionId: string | null = input.fork ? null : input.resumeSessionId ?? null;
@@ -181,6 +241,7 @@ export class SessionStore {
     const live: LiveJob = {
       jobId, interrupt, promise,
       events, cursorSeq, state: { kind: "running" }, stopMode: null, sessionId, input,
+      startedAt: new Date().toISOString(), lastActivityAt: new Date().toISOString(), currentStep: "starting worker",
     };
 
     const onMessage = (msg: SDKMessage): void => {
@@ -189,6 +250,8 @@ export class SessionStore {
         if (typeof sid === "string") { sessionId = sid; live.sessionId = sid; }
       }
       const { kind, summary } = summarizeForRing(msg);
+      live.lastActivityAt = new Date().toISOString();
+      live.currentStep = redactText(summary).slice(0, 160);
       cursorSeq += 1;
       live.cursorSeq = cursorSeq;
       pushEvent(events, { seq: cursorSeq, ts: new Date().toISOString(), kind, summary });
@@ -198,6 +261,8 @@ export class SessionStore {
       const summary = event.kind === "session" ? "session started"
         : event.kind === "assistant" ? event.text : event.summary;
       if (event.kind === "session") live.sessionId = event.sessionId;
+      live.lastActivityAt = new Date().toISOString();
+      live.currentStep = redactText(summary).slice(0, 160);
       cursorSeq += 1;
       live.cursorSeq = cursorSeq;
       pushEvent(events, { seq: cursorSeq, ts: new Date().toISOString(), kind: event.kind, summary: redactText(summary).slice(0, 160) });
@@ -205,7 +270,7 @@ export class SessionStore {
 
     const workerInput: WorkerInput = {
       prompt: input.prompt, operation: input.operation, engine: input.engine, pool: input.model ?? input.pool, cwd: input.cwd,
-      context: input.context,
+      context: input.context, access: input.access,
       agent: input.agent, allowedTools: input.allowedTools, disallowedTools: input.disallowedTools,
       maxTurns: input.maxTurns, timeoutMs: input.timeoutMs, jobId,
       maxBudgetUsd: input.maxBudgetUsd, autoContinue: input.autoContinue,
@@ -231,22 +296,39 @@ export class SessionStore {
       const previous = this.readMeta(jobId);
       let persisted = false;
       try {
+        if (terminal.status === "completed" && input.access?.mode === "read-only" && input.access.report_path) {
+          publishReport(input.access.report_path, terminal.result, input.cwd ?? process.cwd(), this.root());
+        }
+      } catch (error) {
+        terminal = { ...terminal, status: "failed", error: "could not publish assigned report: " + redactText(String(error)) };
+      }
+      terminal = { ...terminal, output: collectOutput(source, terminal.status, terminal.result,
+        [...(input.artifactPaths ?? []), ...(input.access?.mode === "read-only" && input.access.report_path ? [input.access.report_path] : [])], input.cwd ?? process.cwd()) };
+      try {
         new Transcript(jobId, { root: this.root() }).writeMeta({
           job_id: jobId, engine: input.engine, context: input.context, pool: input.model ?? input.pool ?? this.deps.defaults?.pool ?? "",
-          cwd: input.cwd ?? process.cwd(), started_at: new Date().toISOString(),
+          cwd: input.cwd ?? process.cwd(), started_at: live.startedAt,
           ...previous, status: terminal.status, result: terminal.result, error: terminal.error,
           ended_at: new Date().toISOString(), turns: terminal.turns, pool_resolved: terminal.pool_resolved,
           session_id: terminal.session_id, resumable: terminal.resumable,
           continuations: terminal.continuations,
+          access: input.access, output: terminal.output,
         });
         persisted = true;
       } catch (error) {
         terminal = { ...terminal, status: "failed", error: "could not persist terminal job: " + redactText(String(error)), resumable: false };
+        if (terminal.output) terminal.output = { ...terminal.output, outcome: "failed" };
         this.persistenceFault ??= terminal.error;
       }
       live.sessionId = terminal.session_id;
       live.state = { kind: "settled", result: terminal, persisted };
+      live.lastActivityAt = new Date().toISOString();
+      live.currentStep = terminal.status;
       resolveResult(terminal);
+      for (const listener of this.listeners) {
+        try { void Promise.resolve(listener({ job_id: jobId, background: input.background === true, result: { ...terminal, pool_resolved: [...terminal.pool_resolved] } })).catch(() => {}); }
+        catch { }
+      }
       const settled = [...this.live.values()].filter((job) => job.state.kind === "settled");
       for (const job of settled.slice(0, Math.max(0, settled.length - SETTLED_JOB_CAP))) this.live.delete(job.jobId);
     };
@@ -303,6 +385,7 @@ export class SessionStore {
       error: meta.error, session_id: meta.session_id ?? null,
       resumable: meta.resumable ?? meta.session_id != null,
       continuations: meta.continuations ?? 0,
+      ...(meta.output ? { output: meta.output } : {}),
     };
   }
 
@@ -377,6 +460,9 @@ export class SessionStore {
       prompt: input.prompt,
       engine: sourceEngine,
       context: mergeContextPolicy(meta?.context, input.context),
+      access: input.access ?? (meta?.access ? { mode: meta.access.mode } : undefined),
+      artifactPaths: input.artifactPaths,
+      background: input.background,
       operation: input.operation,
       model: input.model ?? input.pool ?? meta?.pool,
       cwd: input.cwd ?? meta?.cwd,

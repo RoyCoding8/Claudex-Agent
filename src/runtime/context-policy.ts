@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { EngineName } from "./engine.js";
+import { RequestError } from "../errors.js";
 
 const tokens = z.number().int().positive();
 export const contextPolicySchema = z.object({
@@ -23,9 +24,9 @@ export const CONTEXT_CONTROLS: Record<EngineName, readonly string[]> = {
   pi: ["window_tokens", "max_output_tokens", "compaction.enabled", "compaction.trigger_tokens", "compaction.keep_recent_tokens"],
 };
 
-export class ContextPolicyError extends Error {
+export class ContextPolicyError extends RequestError {
   constructor(readonly code: "INVALID_ARGUMENT" | "UNSUPPORTED_OPERATION", message: string) {
-    super(message);
+    super(code, message);
     this.name = "ContextPolicyError";
   }
 }

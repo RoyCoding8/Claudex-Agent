@@ -54,6 +54,7 @@ describe("createServer — tool registration", () => {
       "cx_agent_check",
       "cx_agent_compact",
       "cx_agent_fetch",
+      "cx_agent_group",
       "cx_agent_interrupt",
       "cx_agent_list",
       "cx_agent_reply",
@@ -74,7 +75,7 @@ describe("createServer — cx_agent_run", () => {
     const out = (await cb(args, extraObj())) as { content: { type: string; text: string }[]; isError?: boolean };
     expect(out.isError).toBe(false);
     const parsed = JSON.parse(out.content[0].text);
-    expect(parsed).toEqual({ job_id: expect.any(String), result: "ok" });
+    expect(parsed).toMatchObject({ job_id: expect.any(String), result: "ok", output: { outcome: "completed" } });
     expect(run).toHaveBeenCalledTimes(1);
         expect(run.mock.calls[0][0]).toMatchObject({ prompt: "do it", pool: "Worker lvl", progressToken: "tok" });
     expect(typeof run.mock.calls[0][0].sendProgress).toBe("function");

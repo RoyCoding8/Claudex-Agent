@@ -9,9 +9,10 @@ import { retainJobs, redactText } from "./retention.js";
 import { jobStoreDir } from "./paths.js";
 import { ENGINE_CAPABILITIES, type EngineInput, type EngineName, type EngineResult, type WorkerEvent, assertEngineOptionsSupported, resolveEngine } from "./runtime/engine.js";
 import { recordKind, runClaude, toLike } from "./runtime/claude.js";
-import { runCodex } from "./runtime/codex.js";
-import { runPi } from "./runtime/pi.js";
 import { resolveContextPolicy } from "./runtime/context-policy.js";
+import type { AccessPolicy } from "./access.js";
+import type { JobOutput } from "./output.js";
+import { RequestError } from "./errors.js";
 
 export interface WorkerInput {
   prompt: string;
@@ -41,6 +42,7 @@ export interface WorkerInput {
   resumeSessionId?: string;
   fork?: boolean;
   context?: EngineInput["context"];
+  access?: AccessPolicy;
   
   resumedFrom?: string;
 }
@@ -58,6 +60,7 @@ export interface WorkerResult {
   resumable: boolean;
   
   continuations: number;
+  output?: JobOutput;
 }
 
 
@@ -144,6 +147,7 @@ export async function runWorker(
     timeout_ms: timeoutMs,
     ...(engine === "claude" ? { max_turns: maxTurns, max_budget_usd: maxBudgetUsd } : {}),
     thinking: thinking ?? null, effort: effort ?? null, context,
+    access: input.access,
     engine,
   };
   transcript.writeMeta(baseMeta);
@@ -170,7 +174,7 @@ export async function runWorker(
     resumeSessionId: input.resumeSessionId, fork: input.fork,
     maxTurns: input.maxTurns, maxBudgetUsd: input.maxBudgetUsd, autoContinue: input.autoContinue,
     agent: input.agent, allowedTools: input.allowedTools, disallowedTools: input.disallowedTools,
-    thinking: input.thinking, effort, timeoutMs, context,
+    thinking: input.thinking, effort, timeoutMs, context, access: input.access,
   };
   if (engine !== "claude") {
     try {
@@ -252,12 +256,16 @@ export async function runWorker(
           },
         }, interrupt);
         break;
-      case "codex":
+      case "codex": {
+        const { runCodex } = await import("./runtime/codex.js");
         engineResult = await runCodex({ ...engineInput, connection: conn }, { signal: interrupt.signal, emit }, interrupt);
         break;
-      case "pi":
+      }
+      case "pi": {
+        const { runPi } = await import("./runtime/pi.js");
         engineResult = await runPi({ ...engineInput, connection: conn }, { signal: interrupt.signal, emit }, interrupt);
         break;
+      }
       default: {
         const exhaustive: never = engine;
         throw new Error(`Unknown worker engine ${exhaustive}`);
@@ -369,14 +377,15 @@ async function finishFailed(
   };
 }
 
-function assertEngineDefaultsSupported(engine: Exclude<EngineName, "claude">, defaults: AgentDefaults): void {
+export function assertEngineDefaultsSupported(engine: Exclude<EngineName, "claude">, defaults: AgentDefaults): void {
   const unsupported: string[] = [];
   if (defaults.maxTurns !== FALLBACK_DEFAULTS.maxTurns) unsupported.push("max_turns");
   if (defaults.maxBudgetUsd !== FALLBACK_DEFAULTS.maxBudgetUsd) unsupported.push("max_budget_usd");
   if (defaults.autoContinue !== FALLBACK_DEFAULTS.autoContinue) unsupported.push("auto_continue");
   if (defaults.allowedTools.length > 0) unsupported.push("allowed_tools");
   if (defaults.thinking !== undefined) unsupported.push("thinking");
+  if (engine === "pi" && defaults.effort !== undefined) unsupported.push("effort");
   if (unsupported.length > 0) {
-    throw new Error(engine + " does not support these configured Claude options: " + unsupported.join(", ") + ".");
+    throw new RequestError("UNSUPPORTED_OPERATION", engine + " does not support these configured Claude options: " + unsupported.join(", ") + ". Use timeout_ms for a wall-clock limit or engine:claude for these controls.");
   }
 }

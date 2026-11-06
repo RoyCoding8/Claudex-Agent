@@ -32,6 +32,8 @@ cx-agent lets any MCP client delegate to a worker with an independently selected
 
 Set `background:true` on a run or reply to return immediately. `cx_agent_wait` collects the result with a bounded wait. The MCP server owns the worker while its process remains alive. Existing calls without `background:true` continue to block.
 
+`cx_agent_group` runs named tasks together, starts dependent tasks automatically, and returns completion events through one `wait_any` call. The default stdio connection cannot wake the parent model. Setup reports this under `completion_delivery` instead of implying that a notification resumes the parent.
+
 <details>
 <summary><strong>Table of contents</strong></summary>
 
@@ -441,6 +443,12 @@ Pass `engine` per run or set `CX_AGENT_ENGINE`. `cx_agent_setup` reports the ada
 
 Codex and Pi reject Claude-specific tool, thinking, and budget options. Codex accepts `effort`; Pi currently rejects it. Their wall-clock limit remains available through `timeout_ms`. Token usage and changed-file accounting currently come from the Claude SDK path. Pi can select `openai-responses` or `anthropic-messages` through `CX_AGENT_PI_API`. Codex requires bearer authentication. Pi supports API-key authentication with Anthropic Messages and bearer authentication with all three protocols.
 
+### Codex host policy limitations
+
+In a Windows Codex-hosted acceptance run, the Codex SDK completed inference and returned a report, but its `exec_command` call to read `src/errors.ts` with PowerShell `Get-Content` was rejected with `blocked by policy`. The report explicitly left the file contents unverified. Claude and Pi workers read the same file successfully. The policy source remains unresolved; this observation is specific to that host configuration.
+
+A job's `completed` status means its SDK turn finished successfully. Check the report and `output.unresolved_questions` before treating repository inspection as complete. `cx_agent_setup` with `verify:true` verifies the model's streaming protocol; it does not exercise file access or sandbox permissions. If a read is blocked, inspect the result and transcript with `cx_agent_fetch` and check the host's tool and sandbox policy before relying on the worker's findings.
+
 ### Context and automatic compaction
 
 `cx_agent_run` and `cx_agent_reply` accept a `context` object. For example:
@@ -608,13 +616,14 @@ gateway — it only appears if the gateway emits Anthropic-shaped `thinking` blo
 |---|---|
 | `cx_agent_run` | Starts a worker. With `background:true`, returns `{job_id,status:"running"}` immediately. Otherwise waits for completion. |
 | `cx_agent_wait` | Waits up to `timeout_ms` for a result. Default 1000 ms, maximum 30000 ms. Zero checks immediately. |
+| `cx_agent_group` | Creates a group, reports compact status, or waits for terminal events with `action:"wait_any"`. Supports named dependencies and `max_parallel`. |
 | `cx_agent_reply` | Continues a resumable terminal job with a new prompt and job ID. Accepts `background:true`. Inherits the source engine, model, working directory, tools, and reasoning configuration. |
 | `cx_agent_compact` | Compacts a resumable Pi session through its SDK. Accepts optional `instructions`, `background`, and `timeout_ms`. |
-| `cx_agent_check` | Returns recent events after `since_cursor`, the next cursor, status, and whether the job is terminal. |
+| `cx_agent_check` | Returns recent events after `since_cursor`, status, and progress with last activity, elapsed time, and current step. |
 | `cx_agent_fetch` | Reads selected persisted fields. Omitting `fields` returns status and error. |
 | `cx_agent_interrupt` | Stops a running worker. A recorded native session remains available for reply. |
 | `cx_agent_session` | Lists, gets, cancels, or cleans jobs. Terminal cancel clears resumability. Clean supports `statuses`, `older_than_ms`, and `dry_run`. |
-| `cx_agent_setup` | Reports SDK capabilities and checks gateway configuration. Accepts optional `engine` and `model`. Readiness does not establish endpoint protocol compatibility. |
+| `cx_agent_setup` | Separates configuration, model availability, protocol verification, and completion delivery. `verify:true` sends a small paid request for the exact model. |
 | `cx_agent_list` | Lists recent persisted jobs. |
 
 Start work with `cx_agent_run`:
@@ -634,7 +643,30 @@ Collect the result with `cx_agent_wait`:
 { "job_id": "the-returned-job-id", "timeout_ms": 1000 }
 ```
 
-A completed job returns `{job_id,result}`. A failed, interrupted, or incomplete job returns `{job_id,status,error,resumable}` with an optional bounded result excerpt. A wait that expires returns `{job_id,status:"running"}`. Cancelling a wait or the original background request does not stop the worker. To stop work, call `cx_agent_interrupt` or `cx_agent_session` with `action:"cancel"`.
+A completed job returns `{job_id,result,output}`. A failed, interrupted, or incomplete job returns `{job_id,status,error,resumable,output}` with an optional bounded result excerpt. `output` contains source revision and dirty state, outcome, artifact references, and unresolved questions. Questions are `null` unless the final text is JSON with an `unresolved_questions` string array. A wait that expires returns `{job_id,status:"running"}`. Cancelling a wait or the original background request does not stop the worker. To stop work, call `cx_agent_interrupt` or `cx_agent_session` with `action:"cancel"`.
+
+Setup returns `ready:false` until a successful `verify:true` probe. Disabled or static discovery reports model availability as unknown. The probe requests a streaming response, capped at 512 output tokens, 15 seconds, and 64 KiB. It requires assistant text and a successful terminal event. This verifies the wire protocol, not SDK tools, resume, or future service availability. Model IDs are passed unchanged; an abbreviated alias is not automatically expanded.
+
+### Groups and dependencies
+
+```json
+{
+  "action": "create",
+  "name": "parser-review",
+  "max_parallel": 3,
+  "tasks": [
+    { "name": "inputs", "engine": "pi", "model": "worker-model", "access": { "mode": "read-only" }, "prompt": "Review parser input validation." },
+    { "name": "errors", "engine": "pi", "model": "worker-model", "access": { "mode": "read-only" }, "prompt": "Review parser error handling." },
+    { "name": "summary", "depends_on": ["inputs", "errors"], "engine": "pi", "model": "worker-model", "access": { "mode": "read-only" }, "prompt": "Synthesize the prerequisite findings." }
+  ]
+}
+```
+
+Call `cx_agent_group` with `action:"wait_any"`, the returned `group_id`, `after_cursor:0`, and `timeout_ms:30000`. Pass each returned `next_cursor` on the next wait. Events are retained and replayable, with at most 16 per response. A timeout or cancelled wait does not cancel work. Failed, interrupted, or incomplete prerequisites block their dependents. Dependency context includes up to 2048 characters per result and 8192 characters overall; full reports remain available through each job ID.
+
+The whole plan is validated before the first job starts. Group snapshots distinguish queued, running, completed, failed, and blocked tasks. Completed records survive restart. Inputs remain in memory; unfinished tasks are blocked after restart and are never silently rerun. Running workers require the server process to remain alive.
+
+Host integrations can supply `createServer({enqueueParentContinuation})` to enqueue a parent turn after a standalone background job settles. Foreground calls and group investigators do not invoke this callback. The callback receives a stable event ID, job ID, status, short result, resume flag, transcript path, and output metadata. Delivery is attempted once in the running process. A host must implement the continuation itself; the default stdio server and group responses report `parent_resume:false` and provide bounded waits.
 
 If the store cannot write terminal metadata, it reports failure and blocks new jobs and resumes for that server process. Cancellation reports an error when its final metadata cannot be saved. Repair storage and reconcile uncertain job records before restarting. Records still marked `running` after restart cannot be resumed automatically.
 
@@ -670,7 +702,7 @@ The Claude worker runs with a dedicated environment built from the resolved prov
 
 ## Worker Isolation
 
-The Claude worker runs non-interactively under `bypassPermissions`. Its isolation controls are:
+By default, Claude workers run non-interactively under `bypassPermissions`. Its isolation controls are:
 
 1. **Settings isolation (default)** — workers spawn with `settingSources: []`: your MCP servers, hooks, and settings files do **not** load inside delegated sessions. No operator hook fires in a worker, no MCP server spins up per job. Opt back in with `CX_AGENT_INHERIT_SETTINGS=1` (needed if workers must use user-level agents/skills, e.g. the `agent` argument).
 
@@ -679,6 +711,10 @@ The Claude worker runs non-interactively under `bypassPermissions`. Its isolatio
 3. **Recursion guard** — a `CX_AGENT_DEPTH` counter stamped into the worker env at each nesting level. If the incoming depth is ≥ `maxDepth` (default: 2), the worker refuses to spawn before doing any work. This prevents unbounded delegation chains. Override via `agent_defaults.maxDepth` in your config file.
 
 This is a privileged local code-execution service. Workers can modify the selected working directory and run commands. Settings isolation does not provide an operating-system sandbox.
+
+Set `access:{"mode":"read-only"}` for inspection. Claude exposes only `Read`, `Glob`, and `Grep`, disables inherited settings, and denies other permission requests. Pi exposes only its `read` tool. Codex requests its native read-only sandbox and disables ambient MCP servers. Claude and Pi enforce tool restrictions, not an OS sandbox, and may still read paths outside the checkout. A reply inherits the access mode unless explicitly overridden.
+
+An optional `report_path` in read-only mode lets the parent create one assigned report from the final result. The worker receives no write tool. The destination must be a new file in existing directories, outside job storage and without symlinks or junctions. Existing files are never overwritten, and a reply requires a new explicit report path. Use `artifact_paths` to request structured references to other caller-selected files; hashes are returned for files up to 8 MiB. File references do not establish that an artifact is correct or that a worker authored it.
 
 ## Job Metadata
 

@@ -13,6 +13,8 @@ export interface Catalog {
   models: string[];
   ready: boolean;
   diagnostics: string[];
+  source?: "models-endpoint" | "static" | "none";
+  configuration?: "configured" | "missing" | "invalid";
 }
 
 export interface ModelProvider {

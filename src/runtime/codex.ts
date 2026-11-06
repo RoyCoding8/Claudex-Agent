@@ -8,13 +8,14 @@ import type { EngineInput, EngineResult, EngineRunContext } from "./engine.js";
 import { buildRuntimeEnv } from "./engine.js";
 import { InterruptHandle } from "../interrupt.js";
 import { resolveContextPolicy, type ContextPolicy } from "./context-policy.js";
+import type { AccessPolicy } from "../access.js";
 
 type CodexClient = Pick<Codex, "startThread" | "resumeThread">;
 type CodexFactory = (options: CodexOptions) => CodexClient;
 
 export function buildCodexOptions(
   connection: Connection,
-  options: { home?: string; sourceEnv?: NodeJS.ProcessEnv; codexPathOverride?: string; context?: ContextPolicy } = {},
+  options: { home?: string; sourceEnv?: NodeJS.ProcessEnv; codexPathOverride?: string; context?: ContextPolicy; access?: AccessPolicy } = {},
 ): CodexOptions {
   if (connection.authMode === "api-key") {
     throw new Error("Codex SDK custom gateways require bearer-token authentication; this connection uses api-key auth.");
@@ -42,6 +43,7 @@ export function buildCodexOptions(
         },
       },
     },
+    ...(options.access?.mode === "read-only" ? { configOverrides: ["mcp_servers={}"] } : {}),
     env,
   };
 }
@@ -60,13 +62,13 @@ export async function runCodex(
     throw new Error("Codex SDK does not expose native session forking.");
   }
 
-  const options = buildCodexOptions(input.connection, { context: input.context });
+  const options = buildCodexOptions(input.connection, { context: input.context, access: input.access });
   const client = createClient(options);
   const threadOptions: ThreadOptions = {
     model: input.model,
     workingDirectory: input.cwd,
     skipGitRepoCheck: true,
-    sandboxMode: "workspace-write",
+    sandboxMode: input.access?.mode === "read-only" ? "read-only" : "workspace-write",
     approvalPolicy: "never",
     webSearchMode: "disabled",
   };

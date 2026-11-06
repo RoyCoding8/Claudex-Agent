@@ -31,7 +31,7 @@ describe("engine selection and capabilities", () => {
     expect(resolveEngine("codex", {})).toBe("codex");
     expect(parseEngineName("custom")).toBeUndefined();
     expect(() => resolveEngine("custom", {})).toThrow(/Expected claude, codex, pi/);
-    expect(ENGINE_CAPABILITIES.codex).toEqual({ resume: true, fork: false, compact: false, auto_compact: true, context: ["window_tokens", "compaction.trigger_tokens"] });
+    expect(ENGINE_CAPABILITIES.codex).toEqual({ resume: true, fork: false, compact: false, auto_compact: true, context: ["window_tokens", "compaction.trigger_tokens"], read_only: "native-sandbox" });
   });
 
   it("rejects Claude-only restrictions rather than dropping them", () => {
