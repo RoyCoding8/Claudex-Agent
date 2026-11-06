@@ -1,15 +1,21 @@
 // cx-agent SessionStore — seam behind lifecycle tools.
 
 import { type WorkerResult, type WorkerInput, type WorkerDeps, runWorker } from "./worker.js";
-import { newJobId, type JobMeta, type JobStatus } from "./transcript.js";
+import { newJobId, Transcript, type JobMeta, type JobStatus } from "./transcript.js";
 import { InterruptHandle } from "./interrupt.js";
 import { summarizeThinking, type ProgressSender } from "./progress.js";
 import { existsSync, readFileSync } from "node:fs";
 import { joinPath, joinFs, jobStoreDir } from "./paths.js";
 import type { SDKMessage, ThinkingConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { EffortLevel } from "./runtime/claude-sdk.js";
+import { redactText } from "./retention.js";
+import { resolveEngine, type EngineName, type WorkerEvent } from "./runtime/engine.js";
+import { resolveContextPolicy, mergeContextPolicy, type ContextPolicy } from "./runtime/context-policy.js";
 
 const RING_HARD_CAP = 256;
+const SETTLED_JOB_CAP = 128;
+
+type JobState = { kind: "running" } | { kind: "settled"; result: WorkerResult; persisted: boolean };
 
 export interface RingEvent {
   seq: number;
@@ -24,13 +30,17 @@ interface LiveJob {
   promise: Promise<WorkerResult>;
   events: RingEvent[];
   cursorSeq: number;
-  settled: boolean;
-  result: WorkerResult | null;
+  state: JobState;
+  stopMode: "interrupt" | "cancel" | null;
   sessionId: string | null;
+  input: SessionStoreInput;
 }
 
 export interface SessionStoreInput {
   prompt: string;
+  engine?: EngineName;
+  context?: ContextPolicy;
+  operation?: "prompt" | "compact";
   model?: string;
   pool?: string;
   cwd?: string;
@@ -65,7 +75,7 @@ export interface StartHandle {
 }
 
 
-export type ReplyRejection = "unknown_job" | "no_session";
+export type ReplyRejection = "unknown_job" | "no_session" | "not_terminal" | "storage_fault";
 
 
 function nonEmpty(v: string[] | undefined): string[] | undefined {
@@ -139,6 +149,7 @@ function pushEvent(events: RingEvent[], ev: RingEvent): void {
 
 export class SessionStore {
   private readonly live = new Map<string, LiveJob>();
+  private persistenceFault: string | null = null;
   private readonly deps: SessionStoreDeps;
 
   constructor(deps: SessionStoreDeps = {}) {
@@ -155,16 +166,21 @@ export class SessionStore {
 
   /** Register a job, spawn the worker as a detached promise, return the synchronous handle. */
   start(input: SessionStoreInput): StartHandle {
+    if (this.persistenceFault) throw new Error(this.persistenceFault);
+    const engine = resolveEngine(input.engine);
+    input = { ...input, engine, context: resolveContextPolicy(engine, input.context), cwd: input.cwd ?? process.cwd() };
     const run = this.deps.runWorker ?? runWorker;
     const jobId = newJobId();
     const interrupt = new InterruptHandle();
     const events: RingEvent[] = [];
     let cursorSeq = 0;
-    let sessionId: string | null = null;
+    let sessionId: string | null = input.fork ? null : input.resumeSessionId ?? null;
+    let resolveResult: (result: WorkerResult) => void = () => {};
+    const promise = new Promise<WorkerResult>((resolve) => { resolveResult = resolve; });
 
     const live: LiveJob = {
-      jobId, interrupt, promise: null as unknown as Promise<WorkerResult>,
-      events, cursorSeq, settled: false, result: null, sessionId,
+      jobId, interrupt, promise,
+      events, cursorSeq, state: { kind: "running" }, stopMode: null, sessionId, input,
     };
 
     const onMessage = (msg: SDKMessage): void => {
@@ -178,14 +194,24 @@ export class SessionStore {
       pushEvent(events, { seq: cursorSeq, ts: new Date().toISOString(), kind, summary });
     };
 
+    const onEvent = (event: WorkerEvent): void => {
+      const summary = event.kind === "session" ? "session started"
+        : event.kind === "assistant" ? event.text : event.summary;
+      if (event.kind === "session") live.sessionId = event.sessionId;
+      cursorSeq += 1;
+      live.cursorSeq = cursorSeq;
+      pushEvent(events, { seq: cursorSeq, ts: new Date().toISOString(), kind: event.kind, summary: redactText(summary).slice(0, 160) });
+    };
+
     const workerInput: WorkerInput = {
-      prompt: input.prompt, pool: input.model ?? input.pool, cwd: input.cwd,
+      prompt: input.prompt, operation: input.operation, engine: input.engine, pool: input.model ?? input.pool, cwd: input.cwd,
+      context: input.context,
       agent: input.agent, allowedTools: input.allowedTools, disallowedTools: input.disallowedTools,
       maxTurns: input.maxTurns, timeoutMs: input.timeoutMs, jobId,
       maxBudgetUsd: input.maxBudgetUsd, autoContinue: input.autoContinue,
       ...(input.thinking ? { thinking: input.thinking } : {}),
       ...(input.effort ? { effort: input.effort } : {}),
-      sendProgress: input.sendProgress, progressToken: input.progressToken, onMessage,
+      sendProgress: input.sendProgress, progressToken: input.progressToken, onMessage, onEvent,
       ...(input.queryFn ? { queryFn: input.queryFn } : {}),
       ...(input.resumeSessionId ? { resumeSessionId: input.resumeSessionId } : {}),
       ...(input.fork ? { fork: true } : {}),
@@ -197,19 +223,43 @@ export class SessionStore {
       provider: this.deps.provider, transcriptRoot: this.deps.transcriptRoot, interrupt,
     };
 
-    const promise = run(workerInput, workerDeps).then((r: WorkerResult) => {
-      live.settled = true;
-      live.result = r;
-      if (r.session_id) live.sessionId = r.session_id;
-      return r;
-    });
-
-    live.promise = promise;
     this.live.set(jobId, live);
+    const settle = (result: WorkerResult): void => {
+      let terminal = live.stopMode === "cancel"
+        ? { ...result, status: "interrupted" as const, session_id: null, resumable: false, error: "cancelled" }
+        : result;
+      const previous = this.readMeta(jobId);
+      let persisted = false;
+      try {
+        new Transcript(jobId, { root: this.root() }).writeMeta({
+          job_id: jobId, engine: input.engine, context: input.context, pool: input.model ?? input.pool ?? this.deps.defaults?.pool ?? "",
+          cwd: input.cwd ?? process.cwd(), started_at: new Date().toISOString(),
+          ...previous, status: terminal.status, result: terminal.result, error: terminal.error,
+          ended_at: new Date().toISOString(), turns: terminal.turns, pool_resolved: terminal.pool_resolved,
+          session_id: terminal.session_id, resumable: terminal.resumable,
+          continuations: terminal.continuations,
+        });
+        persisted = true;
+      } catch (error) {
+        terminal = { ...terminal, status: "failed", error: "could not persist terminal job: " + redactText(String(error)), resumable: false };
+        this.persistenceFault ??= terminal.error;
+      }
+      live.sessionId = terminal.session_id;
+      live.state = { kind: "settled", result: terminal, persisted };
+      resolveResult(terminal);
+      const settled = [...this.live.values()].filter((job) => job.state.kind === "settled");
+      for (const job of settled.slice(0, Math.max(0, settled.length - SETTLED_JOB_CAP))) this.live.delete(job.jobId);
+    };
+    const fail = (error: unknown): void => settle({
+      status: interrupt.isAborted ? "interrupted" : "failed", result: "", job_id: jobId,
+      pool_resolved: [], turns: 0, transcript_path: joinPath(this.root(), `${jobId}.jsonl`),
+      error: redactText(error instanceof Error ? error.message : String(error)), session_id: live.sessionId,
+      resumable: live.sessionId !== null, continuations: 0,
+    });
+    try { void run(workerInput, workerDeps).then(settle, fail); } catch (error) { fail(error); }
     return { jobId, interrupt };
   }
 
-  /** Block until terminal. cx_agent_run calls this → host auto-backgrounds → task-notification push. */
   async awaitTerminal(jobId: string): Promise<WorkerResult | null> {
     const live = this.live.get(jobId);
     if (live) {
@@ -218,9 +268,34 @@ export class SessionStore {
     return this.readTerminalFromDisk(jobId);
   }
 
+  getTerminal(jobId: string): WorkerResult | null {
+    const live = this.live.get(jobId);
+    if (live) return live.state.kind === "settled" ? live.state.result : null;
+    return this.readTerminalFromDisk(jobId);
+  }
+
+  async waitFor(jobId: string, timeoutMs: number, signal?: AbortSignal): Promise<WorkerResult | null> {
+    const live = this.live.get(jobId);
+    if (!live) return this.readTerminalFromDisk(jobId);
+    if (live.state.kind === "settled") return live.state.result;
+    if (timeoutMs <= 0 || signal?.aborted) return null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort = () => {};
+    const deadline = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), Math.min(timeoutMs, 30_000));
+      onAbort = () => resolve(null);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+    try { return await Promise.race([live.promise, deadline]); }
+    finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    }
+  }
+
   private readTerminalFromDisk(jobId: string): WorkerResult | null {
     const meta = this.readMeta(jobId);
-    if (!meta) return null;
+    if (!meta || meta.status === "running") return null;
     return {
       status: meta.status, result: meta.result ?? "", job_id: jobId,
       pool_resolved: meta.pool_resolved ?? [], turns: meta.turns ?? 0,
@@ -237,15 +312,15 @@ export class SessionStore {
     if (live) {
       return {
         job_id: jobId,
-        status: live.settled && live.result ? live.result.status : "running",
+        status: live.state.kind === "settled" ? live.state.result.status : "running",
         events: live.events.filter((e) => e.seq > sinceCursor),
         nextCursor: live.cursorSeq,
-        terminal: live.settled,
+        terminal: live.state.kind === "settled",
       };
     }
     const meta = this.readMeta(jobId);
     if (!meta) return { job_id: jobId, status: "unknown", events: [], nextCursor: sinceCursor, terminal: true };
-    return { job_id: jobId, status: meta.status, events: [], nextCursor: sinceCursor, terminal: true };
+    return { job_id: jobId, status: meta.status, events: [], nextCursor: sinceCursor, terminal: meta.status !== "running" };
   }
 
   getSessionId(jobId: string): string | null {
@@ -256,7 +331,11 @@ export class SessionStore {
 
   isRunning(jobId: string): boolean {
     const live = this.live.get(jobId);
-    return !!live && !live.settled;
+    return live?.state.kind === "running";
+  }
+
+  forget(jobId: string): void {
+    if (!this.isRunning(jobId)) this.live.delete(jobId);
   }
 
   /** Continue or fork any terminal job's SDK session. Rejects on busy or unknown.
@@ -275,19 +354,30 @@ export class SessionStore {
   reply(
     jobId: string,
     input: Omit<SessionStoreInput, "prompt"> & { prompt: string; fork?: boolean },
-  ): StartHandle | { status: "SESSION_BUSY" | "SESSION_NOT_FOUND"; sessionId: string | null; reason?: ReplyRejection } {
+  ): StartHandle | { status: "SESSION_BUSY" | "SESSION_NOT_FOUND" | "INVALID_ARGUMENT"; sessionId: string | null; reason?: ReplyRejection } {
     if (this.isRunning(jobId)) return { status: "SESSION_BUSY", sessionId: this.getSessionId(jobId) };
     const meta = this.readMeta(jobId);
     const sessionId = this.getSessionId(jobId);
-    if (!sessionId) {
+    if (this.persistenceFault) return { status: "SESSION_BUSY", sessionId, reason: "storage_fault" };
+    if (meta?.status === "running") return { status: "SESSION_BUSY", sessionId, reason: "not_terminal" };
+    const sourceEngine = meta?.engine ?? this.live.get(jobId)?.input.engine ?? "claude";
+    if (input.engine && input.engine !== sourceEngine) return { status: "INVALID_ARGUMENT", sessionId };
+    if (!sessionId || meta?.resumable === false) {
       return {
         status: "SESSION_NOT_FOUND",
         sessionId: null,
         reason: meta ? "no_session" : "unknown_job",
       };
     }
+    if ([...this.live.values()].some((job) => job.state.kind === "running" && job.input.engine === sourceEngine
+      && (job.sessionId === sessionId || job.input.resumeSessionId === sessionId))) {
+      return { status: "SESSION_BUSY", sessionId };
+    }
     return this.start({
       prompt: input.prompt,
+      engine: sourceEngine,
+      context: mergeContextPolicy(meta?.context, input.context),
+      operation: input.operation,
       model: input.model ?? input.pool ?? meta?.pool,
       cwd: input.cwd ?? meta?.cwd,
       agent: input.agent ?? meta?.agent ?? undefined,
@@ -306,23 +396,29 @@ export class SessionStore {
   /** Resumable stop: abort + tree-kill + await terminal write. Job stays resumable via reply. */
   async interrupt(jobId: string, reason = "interrupted"): Promise<{ status: "interrupted" | "not_found" }> {
     const live = this.live.get(jobId);
-    if (!live) return { status: "not_found" };
+    if (!live || live.state.kind === "settled") return { status: "not_found" };
+    live.stopMode ??= "interrupt";
     await live.interrupt.cancel(reason);
     try { await live.promise; } catch { /* defensive */ }
     return { status: "interrupted" };
   }
 
   /** Terminal stop: abort + tree-kill + await terminal write, then detach. Not resumable. */
-  async cancel(jobId: string, reason = "cancelled"): Promise<{ status: "cancelled" | "not_found" }> {
+  async cancel(jobId: string, reason = "cancelled"): Promise<{ status: "cancelled" | "not_found" } | { status: "failed"; error: string }> {
     const live = this.live.get(jobId);
-    if (!live) return { status: "not_found" };
+    if (!live || !this.isRunning(jobId)) return { status: "not_found" };
+    live.stopMode = "cancel";
     await live.interrupt.cancel(reason);
     try { await live.promise; } catch { /* defensive */ }
+    if (live.state.kind === "settled" && !live.state.persisted) {
+      return { status: "failed", error: live.state.result.error ?? "could not persist cancellation" };
+    }
     this.live.delete(jobId);
     return { status: "cancelled" };
   }
 
   readMeta(jobId: string): JobMeta | null {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(jobId)) return null;
     const metaPath = joinFs(this.root(), `${jobId}.meta.json`);
     if (!existsSync(metaPath)) return null;
     try { return JSON.parse(readFileSync(metaPath, "utf8")) as JobMeta; } catch { return null; }

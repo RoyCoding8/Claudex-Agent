@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
-import { makeSpawnWithPid, runWorker, CONTINUE_PROMPT, type WorkerInput } from "../src/worker.js";
+import { runWorker, type WorkerInput } from "../src/worker.js";
+import { makeSpawnWithPid, CONTINUE_PROMPT } from "../src/runtime/claude.js";
 import { InterruptHandle } from "../src/interrupt.js";
 import { FALLBACK_DEFAULTS } from "../src/settings.js";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -115,9 +116,24 @@ describe("runWorker — happy path", () => {
     expect(callOpts.env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:4000");
     expect(callOpts.env.ANTHROPIC_MODEL).toBe("Worker lvl");
     expect(callOpts.env.ANTHROPIC_API_KEY).toBe("");
+    expect(callOpts.env.DISABLE_AUTO_COMPACT).toBeUndefined();
     expect(callOpts.permissionMode).toBe("bypassPermissions");
         const p = caps.map((c) => c.progress);
     for (let i = 1; i < p.length; i++) expect(p[i]).toBeGreaterThan(p[i - 1]);
+  });
+
+  it.each([true, false])("maps Claude context policy to native SDK environment controls with compaction %s", async (enabled) => {
+    const q = fakeQuery(successStream());
+    await runWorker({
+      prompt: "context policy",
+      queryFn: q,
+      context: { window_tokens: 96_000, max_output_tokens: 4_000, compaction: { enabled } },
+      sendProgress: capturingSender([]),
+    }, { defaults: fakeDefaults, validate: fakeValidate, provider: fakeProvider, transcriptRoot: root });
+    const env = q.mock.calls[0][0].options.env;
+    expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe("96000");
+    expect(env.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe("4000");
+    expect(env.DISABLE_AUTO_COMPACT).toBe(enabled ? "0" : "1");
   });
 
   it("passes requested cwd to the SDK and writes terminal metadata", async () => {

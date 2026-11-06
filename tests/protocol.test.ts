@@ -34,8 +34,8 @@ describe("MCP protocol", () => {
     try {
       const listed = await client.listTools();
       expect(listed.tools.map(({ name }) => name).sort()).toEqual([
-        "cx_agent_check", "cx_agent_fetch", "cx_agent_interrupt", "cx_agent_list",
-        "cx_agent_reply", "cx_agent_run", "cx_agent_session", "cx_agent_setup",
+        "cx_agent_check", "cx_agent_compact", "cx_agent_fetch", "cx_agent_interrupt", "cx_agent_list",
+        "cx_agent_reply", "cx_agent_run", "cx_agent_session", "cx_agent_setup", "cx_agent_wait",
       ]);
       const response = await client.callTool({ name: "cx_agent_run", arguments: { prompt: "work", pool: "worker" } });
       const block = response.content.find((item) => item.type === "text");

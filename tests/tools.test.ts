@@ -134,7 +134,7 @@ describe("handleList", () => {
     writeFileSync(join(root, "b.meta.json"), JSON.stringify(meta("job-b", "2026-08-08T00:00:00Z", "running")));
     writeFileSync(join(root, "a.meta.json"), JSON.stringify(meta("job-a", "2026-08-08T01:00:00Z", "completed")));
         writeFileSync(join(root, "stray.jsonl"), "noise");
-    const out = handleList({}, extra(), { root });
+    const out = handleList({ root });
     const text = out.content.text;
     expect(text).toContain("job-a");
     expect(text).toContain("job-b");
@@ -142,7 +142,7 @@ describe("handleList", () => {
   });
 
   it("returns 'No jobs.' when the dir is empty or missing", () => {
-    const out = handleList({}, extra(), { root: "/nonexistent/zz" });
+    const out = handleList({ root: "/nonexistent/zz" });
     expect(out.content.text).toBe("No jobs.");
   });
 
@@ -156,7 +156,7 @@ describe("handleList", () => {
         job_id: "good", status: "completed", pool: "Worker lvl", pool_resolved: [], cwd: "D:/AI",
         started_at: "2026-08-08T00:00:00Z", ended_at: null, turns: 1, cost_usd: null, error: null,
       }));
-      const out = handleList({}, extra(), { root: invalidRoot });
+      const out = handleList({ root: invalidRoot });
       expect(out.content.text).toContain("good");
       expect(out.content.text).not.toContain("bad");
     } finally {
@@ -171,7 +171,7 @@ describe("handleList", () => {
         job_id: "job-ord", status: "completed", pool: "Worker lvl", pool_resolved: [], cwd: "D:/AI",
         started_at: "2026-08-08T01:00:00Z", ended_at: null, turns: 1, cost_usd: null, error: "boom-x",
       }));
-      const out = handleList({}, extra(), { root });
+      const out = handleList({ root });
       const lines = out.content.text.split("\n");
       expect(lines.length).toBe(2);
             expect(lines[0].trimStart().startsWith("job_id")).toBe(true);
@@ -691,6 +691,7 @@ describe("handleSetup — gateway readiness", () => {
     const parsed = JSON.parse(out.content.text);
     expect(parsed).toEqual({
       ready: true, model: "Worker lvl", models: ["Worker lvl", "Opus lvl"], diagnostics: [],
+      engine: "claude", capabilities: { resume: true, fork: true, compact: false, auto_compact: true, context: ["window_tokens", "max_output_tokens", "compaction.enabled"] }, context: null,
     });
     expect(out.isError).toBe(false);
   });
@@ -701,6 +702,17 @@ describe("handleSetup — gateway readiness", () => {
     expect(parsed.ready).toBe(false);
     expect(parsed.diagnostics.join(" ")).toMatch(/unknown model "Bogus"; valid models: Worker lvl, Opus lvl/);
     expect(out.isError).toBe(true);
+  });
+
+  it("reports adapter controls even when gateway discovery throws", async () => {
+    const out = await handleSetup("Worker lvl", { engine: "pi", provider: {
+      ...provider(), discover: async () => { throw new Error("gateway offline"); },
+    } });
+    expect(out.isError).toBe(true);
+    expect(JSON.parse(out.content.text)).toMatchObject({ ready: false, engine: "pi", diagnostics: ["gateway offline"],
+      capabilities: { auto_compact: true, context: ["window_tokens", "max_output_tokens", "compaction.enabled", "compaction.trigger_tokens", "compaction.keep_recent_tokens"] },
+      context: { window_tokens: 128000, max_output_tokens: 8192, compaction: { enabled: true, trigger_tokens: 111616, keep_recent_tokens: 20000 } },
+    });
   });
 
   it("surfaces provider resolution errors as diagnostics instead of throwing", async () => {

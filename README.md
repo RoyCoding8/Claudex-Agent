@@ -1,16 +1,16 @@
 <div align="center">
 
-<img src="assets/banner.svg" alt="cx-agent — blocking delegation bridge for MCP" width="720">
+<img src="assets/banner.svg" alt="cx-agent delegation bridge for MCP" width="720">
 
 <p>
-  <em>Offload long-running agent work to a worker model behind <strong>any</strong> Anthropic-compatible gateway.<br>
-  Block until it is done, then get the result pushed back as a task notification.</em>
+  <em>Delegate work to Claude, Codex, or Pi with your own model gateway.<br>
+  Start a background job, keep working, and collect its result when ready.</em>
 </p>
 
 <p>
   <a href="https://m8ven.ai/mcp/roycoding8-claudex-agent-1wg602"><img src="https://m8ven.ai/badge/mcp/roycoding8-claudex-agent-1wg602" alt="M8ven Score"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="Apache-2.0 license"></a>
-  <img src="https://img.shields.io/badge/node-%3E%3D18-5FA04E?style=flat-square&amp;logo=nodedotjs&amp;logoColor=white" alt="Node >= 18">
+  <img src="https://img.shields.io/badge/node-%3E%3D22.19-5FA04E?style=flat-square&amp;logo=nodedotjs&amp;logoColor=white" alt="Node >= 22.19">
   <img src="https://img.shields.io/badge/MCP-stdio%20server-1F2937?style=flat-square" alt="MCP stdio server">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-64748B?style=flat-square" alt="Windows, macOS, Linux">
 </p>
@@ -28,9 +28,9 @@
 
 ---
 
-cx-agent bridges any MCP client with any Anthropic-compatible gateway (LiteLLM, CLIProxyAPI, claude-code-router, or your own local router) so expensive work runs on cheaper models while the main session stays responsive. It uses the same `@anthropic-ai/claude-agent-sdk` engine as Claude Code itself — not a one-shot subprocess — so the worker gets a full resumable agent session with file tools, bash, and nested subagents.
+cx-agent lets any MCP client delegate to a worker with an independently selected engine and model. Your main agent can use OpenAI while a worker uses another provider through your gateway. Claude uses the Claude Agent SDK. Codex and Pi use their published TypeScript SDKs.
 
-**cx-agent has no built-in knowledge of any specific router product.** It is configured entirely through environment variables: point it at a gateway URL, give it a key and a model, and it runs. Nothing about your gateway is baked into the package.
+Set `background:true` on a run or reply to return immediately. `cx_agent_wait` collects the result with a bounded wait. The MCP server owns the worker while its process remains alive. Existing calls without `background:true` continue to block.
 
 <details>
 <summary><strong>Table of contents</strong></summary>
@@ -59,21 +59,18 @@ cx-agent bridges any MCP client with any Anthropic-compatible gateway (LiteLLM, 
 
 ## Why
 
-Claude Code subagents are powerful but bill to your Anthropic account. cx-agent lets you:
-
-|  |  |
-|---|---|
-| 💸 **Delegate to cheaper models** — any alias your gateway serves (`"Worker lvl"`) or a concrete model id (`"openai/mimo-v2.5-free"`) | ⚡ **Keep the main session responsive** — supporting clients (Claude Code, ZCode) auto-background the call at ~2 minutes and return the result as a push notification |
-| 🔐 **Isolate credentials** — the worker's gateway token never touches your main session's OAuth | ♻️ **Resume and fork** — continue a completed job's conversation or branch it to a new session |
-| 🧱 **Isolate the worker** — no operator hooks, MCP servers, or settings files load inside a delegated session by default | 🧾 **Audit every job** — append-only JSONL transcript plus a `.meta.json` sidecar per run |
+- Select the worker engine and model independently of the main agent.
+- Delegate in the background without depending on client auto-backgrounding.
+- Keep worker gateway credentials separate from the main session.
+- Inspect transcripts and resume supported native sessions.
 
 ## Requirements
 
-- Node.js >= 18
-- A reachable Anthropic-compatible Messages endpoint
+- Node.js >= 22.19.0
+- A gateway exposing the selected engine protocol. Claude requires Anthropic Messages, Codex requires OpenAI Responses, and Pi uses OpenAI Chat Completions by default.
 - `CX_AGENT_BASE_URL`, `CX_AGENT_API_KEY`, and `CX_AGENT_MODEL`
 
-That's the whole dependency story — no install paths, no Python, no specific router required, any platform.
+The default Claude engine is bundled through its SDK. The Codex and Pi SDKs are package dependencies.
 
 ## Quick start
 
@@ -102,7 +99,7 @@ npm run build
 
 cx-agent is a plain **stdio MCP server** — any MCP-capable client can run it. The universal recipe: launch `npx -y cx-agent` with the `CX_AGENT_*` environment variables set. Expand your client below.
 
-> **Timeouts:** `cx_agent_run` **blocks** until the worker finishes — minutes to hours. cx-agent streams MCP progress notifications with a 10 s heartbeat so idle-based clients don't kill the call, but raise your client's tool timeout where it has one (noted per client).
+> Set `background:true` to avoid a long tool call. Use `cx_agent_wait` to collect completion. Blocking calls still emit progress heartbeats, but client timeout and automatic backgrounding behavior depend on the client.
 
 <details>
 <summary><strong>Claude Code</strong></summary>
@@ -137,7 +134,7 @@ Or JSON — `~/.claude.json` (user scope) or `.mcp.json` (project scope, shareab
 }
 ```
 
-Per-server `timeout` (ms) or `MCP_TOOL_TIMEOUT` covers long jobs; unset, the tool timeout defaults to ~28 h. Claude Code auto-backgrounds a long call at ~2 minutes — cx-agent's progress stream is built for exactly this.
+Use `background:true` for long jobs and collect the result with `cx_agent_wait`. If you use blocking calls, configure the client tool timeout to cover the job.
 
 </details>
 
@@ -166,7 +163,7 @@ Per-server `timeout` (ms) or `MCP_TOOL_TIMEOUT` covers long jobs; unset, the too
 }
 ```
 
-Long `cx_agent_run` calls auto-background at ~2 minutes and return as task notifications. (`~/.agents/mcp.json` → `mcpServers` is honored as a fallback location.)
+Use `background:true` and `cx_agent_wait` for a request that returns without waiting for the worker.
 
 </details>
 
@@ -432,13 +429,69 @@ CX_AGENT_MODEL = "Worker lvl"
 
 Your harness not listed? cx-agent is a standard stdio MCP server: point your client at `npx -y cx-agent` (or `node <path-to-repo>/dist/index.js` from a local build) and pass the `CX_AGENT_*` env vars.
 
+## Worker engines
+
+| Engine | Execution | Gateway protocol | Native sessions |
+|---|---|---|---|
+| `claude` | Bundled Claude Agent SDK | Anthropic Messages | Resume and fork |
+| `codex` | Codex TypeScript SDK | OpenAI Responses | Resume |
+| `pi` | Pi TypeScript SDK | OpenAI Chat Completions by default | Resume, fork, and native compaction |
+
+Pass `engine` per run or set `CX_AGENT_ENGINE`. `cx_agent_setup` reports the adapter capabilities. The main agent's provider does not constrain this choice. Each worker still needs a model accepted by its configured endpoint. The current Codex SDK does not expose native fork or manual compaction, so those operations return an unsupported-operation error. Codex and Pi use the explicit gateway credential rather than your main agent's OAuth login.
+
+Codex and Pi reject Claude-specific tool, thinking, and budget options. Codex accepts `effort`; Pi currently rejects it. Their wall-clock limit remains available through `timeout_ms`. Token usage and changed-file accounting currently come from the Claude SDK path. Pi can select `openai-responses` or `anthropic-messages` through `CX_AGENT_PI_API`. Codex requires bearer authentication. Pi supports API-key authentication with Anthropic Messages and bearer authentication with all three protocols.
+
+### Context and automatic compaction
+
+`cx_agent_run` and `cx_agent_reply` accept a `context` object. For example:
+
+```json
+{
+  "engine": "pi",
+  "model": "your-custom-model",
+  "prompt": "Implement the requested change and verify it.",
+  "background": true,
+  "context": {
+    "window_tokens": 64000,
+    "max_output_tokens": 4096,
+    "compaction": {
+      "enabled": true,
+      "trigger_tokens": 48000,
+      "keep_recent_tokens": 12000
+    }
+  }
+}
+```
+
+The SDKs expose different controls:
+
+| Control | Claude | Codex | Pi |
+|---|---|---|---|
+| Context capacity (`window_tokens`) | Yes | Yes | Yes |
+| Response limit (`max_output_tokens`) | Yes | — | Yes |
+| Enable or disable automatic compaction | Yes | — | Yes |
+| Automatic compaction threshold (`trigger_tokens`) | — | Yes | Yes |
+| Recent history retained (`keep_recent_tokens`) | — | — | Yes |
+
+Claude controls map to its documented [environment variables](https://code.claude.com/docs/en/env-vars). Codex capacity and threshold map to [`model_context_window` and `model_auto_compact_token_limit`](https://learn.chatgpt.com/docs/config-file/config-reference) in SDK configuration.
+
+Unsupported controls return `UNSUPPORTED_OPERATION`; inconsistent token budgets return `INVALID_ARGUMENT`. Context capacity describes the actual model or gateway capacity. Setting a larger value cannot increase the endpoint's limit.
+
+Pi defaults to a 128,000-token context capacity, an 8,192-token response limit, automatic compaction above 111,616 tokens, and about 20,000 tokens of retained recent history. Smaller custom capacities derive smaller defaults for output, reserved space, and retained history. Claude and Codex retain their SDK/model defaults when controls are omitted; this server does not report an invented numeric default for them. All three engines support native automatic compaction, which can still fail if the model request fails.
+
+Replies and forks inherit the persisted context policy, including nested compaction settings. Reply overrides merge into that policy; if you shrink the capacity, supply compatible output and compaction limits too. `cx_agent_fetch` with `fields: ["context"]` returns the configured policy, and `cx_agent_setup` reports supported controls under `capabilities.context`. These are configured limits, not live token occupancy.
+
+Manual compaction is separately available for Pi through `cx_agent_compact`. Pi uses native retention rules; a session with too little history returns "Nothing to compact".
+
+Other toolkits, including Antigravity, need an adapter for a documented programmatic API. They are not implemented in this release.
+
 ## Providers
 
-One provider ships: the **gateway** provider — pure env, zero subprocess.
+One gateway provider supplies endpoint configuration and optional model discovery. Engine adapters choose the wire protocol.
 
 | Provider | id | How it discovers models | Requires |
 |---|---|---|---|
-| **gateway** | `gateway` (aliases: `auto`, `openai-compatible`) | optional `GET {baseUrl}/v1/models` or a static `CX_AGENT_MODELS` list | an Anthropic-compatible Messages endpoint |
+| **gateway** | `gateway` (aliases: `auto`, `openai-compatible`) | optional `GET {baseUrl}/v1/models` or a static `CX_AGENT_MODELS` list | an endpoint compatible with the selected engine |
 
 Selection via `CX_AGENT_PROVIDER` (default `auto`): `auto`, `gateway`, and `openai-compatible` are synonyms. Any other value fails fast with a clear config error. The value `cx` is recognized **only to reject it with the v0.3 migration message** — the former built-in cx provider was removed (see [Migration](#migration-from-v02)).
 
@@ -458,6 +511,9 @@ One resolution order per key: **explicit argument → `CX_AGENT_*` env → legac
 
 | Key | Purpose | Default |
 |---|---|---|
+| `CX_AGENT_ENGINE` | `claude`, `codex`, or `pi` | `claude` |
+| `CX_AGENT_CODEX_PATH` | optional SDK executable override | SDK bundled executable |
+| `CX_AGENT_PI_API` | Pi gateway API, see engine support | `openai-completions` |
 | `CX_AGENT_PROVIDER` | `auto` \| `gateway` \| `openai-compatible` | `auto` |
 | `CX_AGENT_BASE_URL` | gateway root URL | — (required) |
 | `CX_AGENT_API_KEY` | endpoint credential | — |
@@ -548,123 +604,53 @@ gateway — it only appears if the gateway emits Anthropic-shaped `thinking` blo
 
 ## Tools
 
-### `cx_agent_run`
+| Tool | Behavior |
+|---|---|
+| `cx_agent_run` | Starts a worker. With `background:true`, returns `{job_id,status:"running"}` immediately. Otherwise waits for completion. |
+| `cx_agent_wait` | Waits up to `timeout_ms` for a result. Default 1000 ms, maximum 30000 ms. Zero checks immediately. |
+| `cx_agent_reply` | Continues a resumable terminal job with a new prompt and job ID. Accepts `background:true`. Inherits the source engine, model, working directory, tools, and reasoning configuration. |
+| `cx_agent_compact` | Compacts a resumable Pi session through its SDK. Accepts optional `instructions`, `background`, and `timeout_ms`. |
+| `cx_agent_check` | Returns recent events after `since_cursor`, the next cursor, status, and whether the job is terminal. |
+| `cx_agent_fetch` | Reads selected persisted fields. Omitting `fields` returns status and error. |
+| `cx_agent_interrupt` | Stops a running worker. A recorded native session remains available for reply. |
+| `cx_agent_session` | Lists, gets, cancels, or cleans jobs. Terminal cancel clears resumability. Clean supports `statuses`, `older_than_ms`, and `dry_run`. |
+| `cx_agent_setup` | Reports SDK capabilities and checks gateway configuration. Accepts optional `engine` and `model`. Readiness does not establish endpoint protocol compatibility. |
+| `cx_agent_list` | Lists recent persisted jobs. |
 
-The primary tool. **BLOCKS** until the worker finishes and returns a structured result.
+Start work with `cx_agent_run`:
 
-```ts
-cx_agent_run(args: {
-  prompt:            string,        // required — verbatim task for the worker
-  model?:            string,        // model alias or concrete model id (default from settings)
-  pool?:             string,        // deprecated alias for `model`
-  cwd?:              string,        // worker working directory
-  agent?:            string,        // nested subagent name inside the worker (requires CX_AGENT_INHERIT_SETTINGS=1)
-  allowed_tools?:    string[],      // when non-empty, restricts the worker's built-in tool menu to exactly these; empty/omitted = all tools
-  disallowed_tools?: string[],      // extra tools to deny the worker (on top of the hazard denylist)
-  max_turns?:        number,        // SDK maxTurns
-  timeout_ms?:       number,        // server-side cap (default 4h)
-  max_budget_usd?:   number,        // SDK maxBudgetUsd for one round
-  auto_continue?:    number,        // budget-stop retries in the same session
-  thinking?:         "adaptive" | "disabled" | number,   // omitted = not sent; number = thinking-token budget
-  thinking_display?: "summarized" | "omitted",           // default "summarized"; ignored without `thinking`
-  effort?:           "low"|"medium"|"high"|"xhigh"|"max",// omitted = not sent
-}): {
-  { job_id: string, result: string }                                                    // completed
-  { job_id: string, status: "failed"|"interrupted"|"incomplete",
-    error: { code: ErrorCode, message: string }, result?: string, truncated?: boolean } // otherwise
+```json
+{
+  "prompt": "Inspect the parser and report malformed input handling.",
+  "engine": "codex",
+  "model": "worker-model",
+  "background": true
 }
 ```
 
-The slim envelope keeps inline context small: turns, transcript path, and timestamps stay on disk and are fetched via `cx_agent_fetch` only when needed. Partial output from `error_max_turns` (status `incomplete`) is returned as a bounded excerpt (max 2 KB) with `truncated: true`.
+Collect the result with `cx_agent_wait`:
 
-Before spawning, the worker runs the same pre-flight as `cx_agent_setup`: the gateway must answer discovery and the model must be in its catalog (when a catalog is available). A misconfigured gateway fails in milliseconds with a diagnostic, not minutes into a job.
-
-At ~2 minutes, clients that support auto-backgrounding (Claude Code, ZCode) suspend the call. The session stays usable. The result arrives as a **task notification** — no second tool call, no polling.
-
-### `cx_agent_reply`
-
-Continue or fork a **completed** job's SDK session with a new prompt. **BLOCKS** like `cx_agent_run` — same push-on-completion path.
-
-```ts
-cx_agent_reply(args: {
-  job_id:           string,        // required — the completed job to resume/fork
-  prompt:           string,        // required — the next user turn, verbatim
-  model?:           string,        // model alias or concrete model id
-  cwd?:             string,        // working directory (default: the resumed job's cwd)
-  agent?:           string,        // nested subagent name
-  allowed_tools?:   string[],      // restrict the worker's tool menu
-  disallowed_tools?: string[],     // extra tools to deny
-  max_turns?:       number,        // SDK maxTurns for this turn
-  timeout_ms?:      number,        // server-side cap (ms)
-  thinking?:        "adaptive" | "disabled" | number,    // default: INHERITED from the resumed job
-  thinking_display?: "summarized" | "omitted",
-  effort?:          "low"|"medium"|"high"|"xhigh"|"max", // default: INHERITED from the resumed job
-  fork?:            boolean,       // true → new session id (original untouched); false (default) → continues the resumed session
-})
+```json
+{ "job_id": "the-returned-job-id", "timeout_ms": 1000 }
 ```
 
-Rejects with `SESSION_BUSY` if the job is still running and `SESSION_NOT_FOUND` if the job or its session_id is unknown. The job stays resumable after `cx_agent_interrupt` — its session_id is retained.
+A completed job returns `{job_id,result}`. A failed, interrupted, or incomplete job returns `{job_id,status,error,resumable}` with an optional bounded result excerpt. A wait that expires returns `{job_id,status:"running"}`. Cancelling a wait or the original background request does not stop the worker. To stop work, call `cx_agent_interrupt` or `cx_agent_session` with `action:"cancel"`.
 
-### `cx_agent_check`
+If the store cannot write terminal metadata, it reports failure and blocks new jobs and resumes for that server process. Cancellation reports an error when its final metadata cannot be saved. Repair storage and reconcile uncertain job records before restarting. Records still marked `running` after restart cannot be resumed automatically.
 
-Ring-buffered event window for a **known** job_id. Returns `{ status, events[], nextCursor, terminal }`. **NOT for waiting on completion** — the buffer is gone once a settled job's live record detaches (returns terminal status with `events:[]`). Use for resumed/external jobs the main agent already has an id for.
+To continue a resumable job, call `cx_agent_reply`:
 
-```ts
-cx_agent_check(args: {
-  job_id:       string,   // the job to inspect
-  since_cursor?: number,  // return events with seq > this cursor (default 0)
-})
+```json
+{ "job_id": "the-returned-job-id", "prompt": "Implement the proposed fix.", "background": true }
 ```
 
-### `cx_agent_fetch`
+Replies require the original engine. Within one server process, a second continuation of the same engine session receives `SESSION_BUSY` while another continuation is running. Engine-specific options are rejected when the selected engine cannot enforce them.
 
-Read selected persisted fields for a job from its `.meta.json` sidecar (or JSONL transcript fallback). Use after `cx_agent_run` returns if you need fields the slim envelope omits.
+Claude accepts `agent`, `allowed_tools`, `disallowed_tools`, `max_turns`, `max_budget_usd`, `auto_continue`, `thinking`, `thinking_display`, and `effort`. `timeout_ms` limits a whole job. Claude budget stops return `incomplete` and can resume through reply. Budget allowances start fresh on a reply.
 
-```ts
-cx_agent_fetch(args: {
-  job_id: string,
-  fields?: ("status"|"result"|"turns"|"pool_resolved"|"transcript_path"|"error"|"started_at"|"ended_at"
-           |"cx_agent_version"|"usage"|"session_id"|"files_changed"|"resumable"|"resumed_from"
-           |"continuations"|"cwd"|"agent"|"budget"|"reasoning")[]
-})
-```
+Fetch omitted details only when needed. Supported fields include `engine`, `session_id`, `files_changed`, `usage`, `turns`, `transcript_path`, `resumable`, `continuations`, and `budget`. `fields:["result"]` returns the full stored result. `fields:["reasoning"]` reads captured thinking blocks from the JSONL transcript and bounds the returned text. The complete schemas are available through MCP `tools/list`.
 
-If `fields` is omitted, returns only `status` + `error`. `result` returns the full untruncated text (`null` when never recorded — distinct from an empty result). `files_changed` returns the sorted union of file paths the worker touched. `session_id` returns the SDK resume handle. The persisted field names (`pool`, `pool_resolved`) are historical and intentionally unchanged.
-
-`reasoning` is the one deliberately large field, and the only one read from the JSONL rather than the sidecar. It returns `{config:{thinking,effort}, blocks, redacted, chars, truncated, text}` — `text` byte-capped at 8 KB, `chars` the true total — and is empty unless the job ran with `thinking` set. It is excluded from `cx_agent_session get`'s full-sidecar view for that reason; request it explicitly.
-
-### `cx_agent_interrupt`
-
-Resumable kill of a running job's process tree and resolves the pending `cx_agent_run` call as `status: "interrupted"`. The job stays **resumable** via `cx_agent_reply` (session_id is retained).
-
-For a **terminal** (non-resumable) stop, use `cx_agent_session` with `action: "cancel"`.
-
-### `cx_agent_session`
-
-Manager over job records: list, get, cancel, and clean.
-
-```ts
-cx_agent_session(args: {
-  action:        "list" | "get" | "cancel" | "clean",
-  job_id?:       string,                                    // required for get/cancel
-  statuses?:     ("completed"|"failed"|"interrupted"|"incomplete")[],  // clean: filter by terminal status
-  older_than_ms?: number,                                   // clean: only remove jobs older than this
-  dry_run?:      boolean,                                   // clean: preview without deleting
-})
-```
-
-- **list** — one-line-per-job from on-disk sidecars (same as `cx_agent_list`)
-- **get** — full meta for a job_id (all fetch fields)
-- **cancel** — terminal stop of a live job (**not resumable** — prefer `cx_agent_interrupt` for resumable)
-- **clean** — delete terminal job files; accepts `statuses` / `older_than_ms` filters; `dry_run` previews without deleting
-
-### `cx_agent_setup`
-
-Endpoint configuration check. Returns `{ ready, model, models, diagnostics }`. With discovery disabled, `ready` confirms that the URL and model are configured; the first worker request remains the authoritative connectivity check. With static or endpoint discovery, the model is also validated against the catalog. Takes no input.
-
-### `cx_agent_list`
-
-Operator convenience: one-line-per-job from on-disk sidecars. **Not for waiting on running jobs.** Most-recent first.
+Background jobs require the MCP server process to stay alive. Completed records survive a restart. Running jobs are not automatically restarted or recovered after a server crash.
 
 ## Structured Errors
 
@@ -674,25 +660,25 @@ Every non-completed result carries a typed error envelope:
 { code: ErrorCode, message: string }
 ```
 
-Error codes: `INVALID_ARGUMENT`, `SESSION_NOT_FOUND`, `SESSION_BUSY`, `PERMISSION_REQUEST_NOT_FOUND`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`, `TIMEOUT`, `CANCELLED`, `INTERRUPTED`, `INCOMPLETE`, `INTERNAL`.
+Error codes: `INVALID_ARGUMENT`, `UNSUPPORTED_OPERATION`, `SESSION_NOT_FOUND`, `SESSION_BUSY`, `PERMISSION_REQUEST_NOT_FOUND`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`, `TIMEOUT`, `CANCELLED`, `INTERRUPTED`, `INCOMPLETE`, `INTERNAL`.
 
 The `isError: true` flag is also set for MCP clients that key on it; `error.code` is authoritative.
 
 ## Credential Isolation
 
-The worker runs with a dedicated environment built from the resolved provider connection. Bearer mode sets only `ANTHROPIC_AUTH_TOKEN`; API-key mode sets only `ANTHROPIC_API_KEY`. Both set `ANTHROPIC_BASE_URL` and the selected model aliases. Ambient Anthropic credentials are never copied, and provider extras cannot replace the selected URL, credential, or model.
+The Claude worker runs with a dedicated environment built from the resolved provider connection. Bearer mode sets only `ANTHROPIC_AUTH_TOKEN`; API-key mode sets only `ANTHROPIC_API_KEY`. Both set `ANTHROPIC_BASE_URL` and the selected model aliases. Ambient Anthropic credentials are never copied, and provider extras cannot replace the selected URL, credential, or model. Codex uses a private `CODEX_HOME` and an explicit SDK environment. Pi uses in-memory authentication and private session storage.
 
 ## Worker Isolation
 
-The worker runs non-interactively under `bypassPermissions`. Three layers of isolation:
+The Claude worker runs non-interactively under `bypassPermissions`. Its isolation controls are:
 
 1. **Settings isolation (default)** — workers spawn with `settingSources: []`: your MCP servers, hooks, and settings files do **not** load inside delegated sessions. No operator hook fires in a worker, no MCP server spins up per job. Opt back in with `CX_AGENT_INHERIT_SETTINGS=1` (needed if workers must use user-level agents/skills, e.g. the `agent` argument).
 
-2. **Hazard tool denylist** — tools that would stall a blocking session, create operator-session side effects, or self-delegate are always denied: interactive/plan/worktree/scheduling/notification tools plus all eight `cx_agent_*` tools in bare and MCP-qualified form.
+2. **Hazard tool denylist** — tools that would stall a blocking session, create operator-session side effects, or self-delegate are always denied: interactive/plan/worktree/scheduling/notification tools plus all `cx_agent_*` tools in bare and MCP-qualified form.
 
 3. **Recursion guard** — a `CX_AGENT_DEPTH` counter stamped into the worker env at each nesting level. If the incoming depth is ≥ `maxDepth` (default: 2), the worker refuses to spawn before doing any work. This prevents unbounded delegation chains. Override via `agent_defaults.maxDepth` in your config file.
 
-**Trust model:** this is a privileged local code-execution service. Anyone who can reach the MCP server can spawn workers that run with `bypassPermissions` in the configured `cwd`. Expose it only to your own MCP clients.
+This is a privileged local code-execution service. Workers can modify the selected working directory and run commands. Settings isolation does not provide an operating-system sandbox.
 
 ## Job Metadata
 
@@ -733,32 +719,25 @@ Each job writes an append-only JSONL transcript to `<dataDir>/agents/<job_id>.js
 
 Kind values: `system | assistant | user | tool_use | tool_result | result | error | progress`.
 
-Payloads are the whole SDK message, so an `assistant` record carries its `thinking` / `redacted_thinking`
+Claude payloads are the whole SDK message, so an `assistant` record carries its `thinking` / `redacted_thinking`
 blocks verbatim, signatures included. This is the only place reasoning text is stored, and it is what
 `cx_agent_fetch fields:["reasoning"]` reads. Signatures are never redacted — stripping them would break
-any future replay of the message back to the API.
+any future replay of the message back to the API. Codex and Pi transcripts contain normalized session, assistant, and tool events.
 
 ## Architecture
 
-```
-Main harness session (operator credentials — never copied into the worker)
-  └─[stdio MCP]→ cx-agent server (Node/TypeScript)
-        ├─ resolveProvider() → ModelProvider (gateway: pure env, zero subprocess)
-        │     Connection { baseUrl, apiKey, authMode, model, extraEnv? }
-        ├─ query() from @anthropic-ai/claude-agent-sdk
-        │     runtime/claude-sdk.ts maps Connection → ANTHROPIC_* + CLAUDE_CODE_* env
-        │     (the only module that knows Anthropic/Claude-Code env names)
-        ├─ streams SDK messages → MCP progress notifications (strictly increasing)
-        ├─ writes <dataDir>/agents/<job_id>.jsonl transcript + .meta.json sidecar
-        ├─ enforces recursion guard (maxDepth, default 2)
-        ├─ spawns workers with settingSources: [] (opt-in inheritance)
-        ├─ denies hazard tools to the worker
-        └─ BLOCKS until terminal → returns structured result
-              ↓ at ~2 min, supporting harnesses auto-background the call;
-                result arrives as a task notification (no polling)
+```text
+MCP client
+  -> tool schemas and handlers
+  -> SessionStore owns jobs, waits, interruption, and session locks
+  -> runWorker handles shared execution and terminal persistence
+     -> runtime/claude.ts: Claude Agent SDK and continuation loop
+     -> runtime/codex.ts: Codex SDK
+     -> runtime/pi.ts: Pi SDK
+  -> JSONL transcripts and job metadata
 ```
 
-The provider/runtime split is deliberate: `ModelProvider` knows where models come from and nothing about Anthropic; `AgentRuntime` knows the Anthropic-shaped env and nothing about gateways. `Connection` is the whole contract between them.
+Engine choice is separate from gateway choice. The gateway supplies endpoint credentials and model names. Each engine adapter owns its native invocation and returns one shared terminal result type. The worker owns deadlines, heartbeat, interruption precedence, and terminal persistence. The job store owns request-independent execution and session locks. Context validation, defaults, and supported controls live in `runtime/context-policy.ts`.
 
 ## Migration from v0.2
 
@@ -776,7 +755,7 @@ cx-agent does not start or manage an endpoint process. With the default discover
 
 ## Cross-platform
 
-- **Process-tree kill** — Windows uses `taskkill /T /F`; POSIX spawns the worker `detached: true` so it owns a process group, then `kill(-pid, SIGTERM)` escalating to `SIGKILL` after a grace window.
+- **Claude process cleanup** — Windows uses `taskkill /T /F`; POSIX spawns the worker `detached: true` so it owns a process group, then `kill(-pid, SIGTERM)` escalating to `SIGKILL` after a grace window. Codex and Pi use their SDK cancellation mechanisms.
 - **Shell path** — `CX_AGENT_SHELL_PATH` / `CLAUDE_CODE_GIT_BASH_PATH` is meaningful only on win32; on POSIX the key is omitted entirely rather than set to a bogus default.
 
 CI runs the complete verification pipeline on Windows x64, Ubuntu x64, Ubuntu ARM64, and macOS. GitHub's standard `ubuntu-24.04-arm` runner requires a public repository or an account with that runner available.
@@ -784,13 +763,16 @@ CI runs the complete verification pipeline on Windows x64, Ubuntu x64, Ubuntu AR
 ## Development
 
 ```bash
-npm test          # run vitest suite (hermetic — no live model calls, no network)
+npm test          # run Vitest with local fixtures and no external model calls
 npm run typecheck # tsc --noEmit
 npm run build     # tsup → dist/index.js
 npm run smoke     # initialize the built MCP server and list its tools over stdio
-npm run verify    # typecheck, tests, build, and packaged MCP smoke test
+npm run verify    # typecheck, tests, build, MCP and SDK smoke tests
+npm run smoke:engines # exercise Codex and Pi SDKs against a local test gateway
 npm run smoke:live # make one minimal request against the configured endpoint
 ```
+
+`smoke:engines` exercises the installed SDK dependencies. It uses a local test endpoint and makes no paid model requests. Pass one engine to test it alone, such as `npm run smoke:engines -- codex`.
 
 `smoke:live` requires the three core variables in its process environment and may consume provider credits. It restricts the worker tool menu and removes its temporary transcript directory after the check.
 

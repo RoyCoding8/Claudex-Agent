@@ -46,12 +46,13 @@ function getHandler(server: { _registeredTools: Record<string, { handler: (a: un
 }
 
 describe("createServer — tool registration", () => {
-  it("registers exactly the eight tools", async () => {
+  it("registers the public tools", async () => {
     const { server } = createServer({ runWorker: fakeWorker() });
     // @ts-expect-error: _registeredTools is private; read for test.
     const tools = server["_registeredTools"] as Record<string, unknown>;
     expect(Object.keys(tools).sort()).toEqual([
       "cx_agent_check",
+      "cx_agent_compact",
       "cx_agent_fetch",
       "cx_agent_interrupt",
       "cx_agent_list",
@@ -59,6 +60,7 @@ describe("createServer — tool registration", () => {
       "cx_agent_run",
       "cx_agent_session",
       "cx_agent_setup",
+      "cx_agent_wait",
     ]);
   });
 });

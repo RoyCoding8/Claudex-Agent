@@ -2,6 +2,7 @@
 
 export type ErrorCode =
   | "INVALID_ARGUMENT"
+  | "UNSUPPORTED_OPERATION"
   | "SESSION_NOT_FOUND"
   | "SESSION_BUSY"
   | "PERMISSION_REQUEST_NOT_FOUND"
@@ -38,6 +39,7 @@ export function structured(code: ErrorCode, message: string): StructuredError {
 export function defaultMessage(code: ErrorCode): string {
   switch (code) {
     case "INVALID_ARGUMENT": return "invalid argument";
+    case "UNSUPPORTED_OPERATION": return "the selected engine does not support this operation";
     case "SESSION_NOT_FOUND": return "no job with that id was found";
     case "SESSION_BUSY": return "the session is still running; reply after it completes";
     case "PERMISSION_REQUEST_NOT_FOUND": return "no pending permission request for that id";

@@ -2,7 +2,7 @@
   "name": "cx-agent",
   "version": "0.3.0",
   "type": "module",
-  "description": "A blocking bridge MCP server that offloads long tasks to a worker model behind any Anthropic-compatible gateway via the Claude Agent SDK. Blocks the tool call until terminal; emits progress so the call survives the stdio idle window.",
+  "description": "An MCP delegation server with background jobs, selectable Claude, Codex and Pi workers, and custom model gateways.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/RoyCoding8/Claudex-Agent#readme",
   "repository": {
@@ -38,17 +38,21 @@
     "start": "node dist/index.js",
     "smoke": "node scripts/smoke.mjs",
     "smoke:live": "node scripts/live-smoke.mjs",
+    "smoke:engines": "node scripts/engine-smoke.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "verify": "npm run typecheck && npm test && npm run build && npm run smoke"
+    "verify": "npm run typecheck && npm test && npm run build && npm run smoke && npm run smoke:engines"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.19.0"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.250",
+    "@earendil-works/pi-ai": "1.5.0",
+    "@earendil-works/pi-coding-agent": "1.5.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "@openai/codex-sdk": "0.166.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {

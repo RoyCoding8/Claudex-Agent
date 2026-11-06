@@ -3,6 +3,9 @@
 import { existsSync, readFileSync } from "node:fs";
 
 const LEGACY_ALIASES = {
+  CX_AGENT_ENGINE: [],
+  CX_AGENT_CODEX_PATH: [],
+  CX_AGENT_PI_API: [],
   CX_AGENT_PROVIDER: [],
   CX_AGENT_BASE_URL: [],
   CX_AGENT_API_KEY: [],

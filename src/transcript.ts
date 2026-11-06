@@ -5,6 +5,8 @@ import type { ThinkingConfig } from "@anthropic-ai/claude-agent-sdk";
 import { joinPath, resolveFs, jobStoreDir } from "./paths.js";
 import { redactPayload } from "./retention.js";
 import type { EffortLevel } from "./runtime/claude-sdk.js";
+import type { EngineName, TokenUsage } from "./runtime/engine.js";
+import type { ContextPolicy } from "./runtime/context-policy.js";
 
 export type RecordKind =
   | "system"
@@ -28,6 +30,8 @@ export type JobStatus = "running" | "completed" | "failed" | "interrupted" | "in
 
 export interface JobMeta {
   job_id: string;
+  engine?: EngineName;
+  context?: ContextPolicy;
   status: JobStatus;
   pool: string;
   pool_resolved: string[];
@@ -38,12 +42,7 @@ export interface JobMeta {
   error: string | null;
   result?: string | null;
   cx_agent_version?: string;
-  usage?: {
-    input_tokens: number;
-    output_tokens: number;
-    cache_creation_input_tokens: number;
-    cache_read_input_tokens: number;
-  };
+  usage?: TokenUsage;
   session_id?: string | null;
   files_changed?: string[];
   
@@ -112,11 +111,7 @@ export class Transcript {
 
   /** Write/overwrite the meta sidecar. */
   writeMeta(meta: JobMeta): void {
-    try {
-      writeFileSync(this.fsMetaPath, JSON.stringify(meta, null, 2), "utf8");
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
-    }
+    writeFileSync(this.fsMetaPath, JSON.stringify(meta, null, 2), "utf8");
   }
 
   /** Read the meta sidecar, or null if none exists. */

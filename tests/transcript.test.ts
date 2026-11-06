@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, rmdirSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Transcript, newJobId, type JobMeta } from "../src/transcript.js";
@@ -13,6 +13,14 @@ afterEach(() => {
 });
 
 describe("Transcript", () => {
+  it("reports a missing metadata directory instead of reporting a successful write", () => {
+    const transcript = new Transcript("missing-directory", { root });
+    rmdirSync(root);
+    expect(() => transcript.writeMeta({ job_id: "missing-directory", status: "completed", pool: "model", pool_resolved: [],
+      cwd: root, started_at: "2026-11-05T00:00:00Z", ended_at: "2026-11-05T00:00:01Z", turns: 1, error: null,
+    })).toThrow();
+  });
+
   it("creates root dir and writes a .jsonl + .meta.json at the right paths", () => {
     const t = new Transcript("job-1", { root });
     t.append("system", { msg: "start" });

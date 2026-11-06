@@ -12,6 +12,8 @@ import { type ProgressSender } from "./progress.js";
 import { resolveProvider, type ModelProvider, type Catalog } from "./providers/registry.js";
 import { EFFORT_LEVELS, THINKING_DISPLAYS, buildThinkingConfig, isEffortLevel, isThinkingDisplay, parseThinkingSpec } from "./runtime/claude-sdk.js";
 import { structured, withStructured, codeForStatus, type StructuredError } from "./errors.js";
+import { ENGINE_NAMES, ENGINE_CAPABILITIES, parseEngineName, resolveEngine, type EngineName } from "./runtime/engine.js";
+import { contextPolicySchema, parseContextPolicy, ContextPolicyError, resolveContextPolicy, type ContextPolicy } from "./runtime/context-policy.js";
 
 
 export type SlimResult =
@@ -28,6 +30,7 @@ export type SlimResult =
 
 const SLIM_RESULT_EXCERPT = 2048;
 const REASONING_EXCERPT = 8192;
+const jobIdSchema = z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/, "Expected a job ID without path separators");
 
 function boundExcerpt(text: string, limit = SLIM_RESULT_EXCERPT, hint = 'use cx_agent_fetch fields:["result"]'): { excerpt: string; truncated: boolean } {
   if (!text) return { excerpt: "", truncated: false };
@@ -112,6 +115,9 @@ const reasoningInputSchema = (omitted: string) => ({
 
 export const runInputSchema = {
   prompt: z.string().min(1).describe("The task to delegate, verbatim."),
+  engine: z.enum(ENGINE_NAMES).optional().describe("Worker SDK, independent of the main agent. claude, codex, or pi. Default CX_AGENT_ENGINE or claude."),
+  context: contextPolicySchema.optional().describe("Per-session context and native automatic compaction controls. Supported fields vary by SDK; see cx_agent_setup capabilities.context. Inherited on reply. Does not increase the model endpoint's actual context limit."),
+  background: z.boolean().optional().describe("Return a job_id immediately and keep working independently of this request. Recommended for clients that block turns during tool calls. Retrieve completion with cx_agent_wait. Default false for compatibility."),
   model: z.string().optional().describe("Model alias or concrete model id served by the configured gateway (default: from settings)."),
   pool: z.string().optional().describe("Deprecated alias for `model`. Use `model` instead."),
   cwd: z.string().optional().describe("Working directory for the worker."),
@@ -137,13 +143,16 @@ export const runInputSchema = {
 export const listInputSchema = {};
 
 export const interruptInputSchema = {
-  job_id: z.string().min(1).describe("The job_id to interrupt (from a running cx_agent_run)."),
+  job_id: jobIdSchema.describe("The job_id to interrupt (from a running cx_agent_run)."),
 };
 
 export const replyInputSchema = {
-  job_id: z.string().min(1)
+  job_id: jobIdSchema
     .describe("The job_id to continue or fork. Any TERMINAL job that holds a session works — completed, incomplete (max_turns / max_budget / timeout), or interrupted."),
   prompt: z.string().min(1).describe("The next user turn, verbatim."),
+  background: runInputSchema.background,
+  engine: runInputSchema.engine.describe("Must match the source job engine. Omitted inherits it. Cross-engine session resume is unsupported."),
+  context: runInputSchema.context,
   model: z.string().optional().describe("Model alias or concrete model id. Default: INHERITED from the resumed job."),
   pool: z.string().optional().describe("Deprecated alias for `model`."),
   cwd: z.string().optional()
@@ -164,28 +173,41 @@ export const replyInputSchema = {
 };
 
 export const checkInputSchema = {
-  job_id: z.string().min(1).describe("The job_id to inspect (a KNOWN id — do not use this to wait on a job)."),
+  job_id: jobIdSchema.describe("The job_id to inspect. Use cx_agent_wait to collect completion."),
   since_cursor: z.number().int().min(0).optional().describe("Return events with seq > this cursor (default 0)."),
+};
+
+export const waitInputSchema = {
+  job_id: jobIdSchema.describe("The background job to wait for."),
+  timeout_ms: z.number().int().min(0).max(30_000).optional()
+    .describe("Wait at most this many milliseconds. Default 1000, maximum 30000. Zero checks immediately. A wait timeout or request cancellation leaves the worker running."),
+};
+
+export const compactInputSchema = {
+  job_id: jobIdSchema.describe("A terminal resumable job whose engine supports native compaction."),
+  instructions: z.string().optional().describe("Optional guidance for the SDK's native compaction."),
+  background: runInputSchema.background,
+  timeout_ms: runInputSchema.timeout_ms,
 };
 
 export const sessionInputSchema = {
   action: z.enum(["list", "get", "cancel", "clean"]).describe("list: one-line-per-job; get: full meta; cancel: terminal stop of a running job; clean: delete terminal job files."),
-  job_id: z.string().min(1).optional().describe("Required for get/cancel."),
+  job_id: jobIdSchema.optional().describe("Required for get/cancel."),
   statuses: z.array(z.enum(["completed", "failed", "interrupted", "incomplete"])).optional()
     .describe("clean: only remove jobs whose terminal status is in this list."),
   older_than_ms: z.number().int().min(0).optional().describe("clean: only remove jobs older than this many ms."),
   dry_run: z.boolean().optional().describe("clean: list what would be removed without deleting (default false)."),
 };
 
-export const setupInputSchema = {};
+export const setupInputSchema = { engine: runInputSchema.engine, model: runInputSchema.model };
 
 export const fetchInputSchema = {
-  job_id: z.string().min(1).describe("The job_id to fetch details for."),
+  job_id: jobIdSchema.describe("The job_id to fetch details for."),
   fields: z
     .array(z.enum([
       "status", "result", "turns", "pool_resolved", "transcript_path", "error",
       "started_at", "ended_at", "cx_agent_version", "usage", "session_id", "files_changed",
-      "resumable", "resumed_from", "continuations", "cwd", "agent", "budget", "reasoning",
+      "resumable", "resumed_from", "continuations", "cwd", "agent", "budget", "reasoning", "engine", "context",
     ]))
     .optional()
     .describe(
@@ -243,6 +265,9 @@ function trackInterruptableJob(
 /** Common tool-args → SessionStoreInput mapping for run and reply. */
 function toStoreInput(args: Record<string, unknown>): Omit<SessionStoreInput, "prompt"> {
   return {
+    engine: parseEngineName(args.engine),
+    context: parseContextPolicy(args.context),
+    operation: args.operation === "compact" ? "compact" : undefined,
     model: typeof args.model === "string" ? args.model : typeof args.pool === "string" ? args.pool : undefined,
     cwd: typeof args.cwd === "string" ? args.cwd : undefined,
     agent: typeof args.agent === "string" ? args.agent : undefined,
@@ -267,12 +292,42 @@ function announceJobId(sendProgress: ProgressSender, progressToken: string | num
   sendProgress({ progressToken, progress: 0, message: `job ${jobId} started` });
 }
 
+async function finishStartedJob(
+  started: StartHandle,
+  store: SessionStore,
+  background: boolean,
+  extra: ToolHandlerExtra,
+  registry?: InterruptRegistry,
+): Promise<{ content: { type: "text"; text: string }; isError?: boolean }> {
+  if (background) return { content: { type: "text", text: JSON.stringify({ job_id: started.jobId, status: "running" }) } };
+  const tracked = trackInterruptableJob(registry, extra.signal, started.jobId, started.interrupt);
+  announceJobId(makeMcpProgressSender(extra.sendNotification, extra.progressToken), extra.progressToken, started.jobId);
+  try {
+    const result = await store.awaitTerminal(started.jobId);
+    if (!result) return { content: { type: "text", text: JSON.stringify(withStructured({ job_id: started.jobId, status: "failed" }, "INTERNAL", "the job produced no terminal record")) }, isError: true };
+    return { content: { type: "text", text: JSON.stringify(toSlimResult(result)) }, isError: result.status !== "completed" };
+  } finally { tracked.cleanup(); }
+}
+
+export async function handleWait(
+  args: { job_id: string; timeout_ms?: number },
+  store: SessionStore,
+  signal?: AbortSignal,
+): Promise<{ content: { type: "text"; text: string }; isError?: boolean }> {
+  const waited = await store.waitFor(args.job_id, args.timeout_ms ?? 1000, signal);
+  const result = waited ?? store.getTerminal(args.job_id);
+  if (result) return { content: { type: "text", text: JSON.stringify(toSlimResult(result)) }, isError: result.status !== "completed" };
+  const status = store.poll(args.job_id).status;
+  if (status === "unknown") return { content: { type: "text", text: JSON.stringify(withStructured({ job_id: args.job_id, status: "not_found" }, "SESSION_NOT_FOUND", "no job with that id")) }, isError: true };
+  return { content: { type: "text", text: JSON.stringify({ job_id: args.job_id, status }) } };
+}
+
 export async function handleRun(
   args: Record<string, unknown>,
   extra: ToolHandlerExtra,
   deps: RunHandlerDeps = {},
 ): Promise<{ content: { type: "text"; text: string }; isError?: boolean }> {
-  const sendProgress = makeMcpProgressSender(extra.sendNotification, extra.progressToken);
+  const sendProgress = args.background === true ? undefined : makeMcpProgressSender(extra.sendNotification, extra.progressToken);
   // Run goes through the SessionStore so the job is visible to cx_agent_check,
   // cx_agent_interrupt and cx_agent_session while it is still running.
   const store = deps.store ?? new SessionStore({
@@ -291,32 +346,18 @@ export async function handleRun(
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return {
-      content: { type: "text", text: JSON.stringify({ job_id: null, status: "failed", error: structured("INTERNAL", msg) }) },
+      content: { type: "text", text: JSON.stringify({ job_id: null, status: "failed", error: structured(e instanceof ContextPolicyError ? e.code : "INTERNAL", msg) }) },
       isError: true,
     };
   }
-  const tracked = trackInterruptableJob(deps.registry, extra.signal, started.jobId, started.interrupt);
-  announceJobId(sendProgress, extra.progressToken, started.jobId);
   try {
-    const result = await store.awaitTerminal(started.jobId);
-    if (!result) {
-      return {
-        content: { type: "text", text: JSON.stringify({ job_id: started.jobId, status: "failed", error: structured("INTERNAL", "the job produced no terminal record") }) },
-        isError: true,
-      };
-    }
-    return {
-      content: { type: "text", text: JSON.stringify(toSlimResult(result)) },
-      isError: result.status !== "completed",
-    };
+    return await finishStartedJob(started, store, args.background === true, extra, deps.registry);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return {
       content: { type: "text", text: JSON.stringify({ job_id: started.jobId, status: "failed", error: structured("INTERNAL", msg) }) },
       isError: true,
     };
-  } finally {
-    tracked.cleanup();
   }
 }
 
@@ -330,8 +371,6 @@ function isJobMeta(value: unknown): value is JobMeta {
 }
 
 export function handleList(
-  _args: Record<string, never>,
-  _extra: ToolHandlerExtra,
   opts: { root?: string } = {},
 ): { content: { type: "text"; text: string } } {
   const root = opts.root ?? transcriptDir();
@@ -385,14 +424,14 @@ export async function handleInterrupt(
 export type FetchField =
   | "status" | "result" | "turns" | "pool_resolved"
   | "transcript_path" | "error" | "started_at" | "ended_at" | "cx_agent_version" | "usage" | "session_id" | "files_changed"
-  | "resumable" | "resumed_from" | "continuations" | "cwd" | "agent" | "budget" | "reasoning";
+  | "resumable" | "resumed_from" | "continuations" | "cwd" | "agent" | "budget" | "reasoning" | "engine" | "context";
 
 /** Every field handleSession(get) returns — the full sidecar view.
  *  `reasoning` is excluded on purpose: it reads the JSONL and can be large, so it stays opt-in. */
 export const ALL_FETCH_FIELDS: FetchField[] = [
   "status", "result", "turns", "pool_resolved", "transcript_path", "error",
   "started_at", "ended_at", "cx_agent_version", "usage", "session_id", "files_changed",
-  "resumable", "resumed_from", "continuations", "cwd", "agent", "budget",
+  "resumable", "resumed_from", "continuations", "cwd", "agent", "budget", "engine", "context",
 ];
 
 /** Default fields returned when `fields` is omitted. */
@@ -425,6 +464,8 @@ export function handleFetchJob(
   const out: Record<string, unknown> = { job_id: args.job_id };
   for (const f of fields) {
     switch (f) {
+      case "engine": out.engine = meta.engine ?? "claude"; break;
+      case "context": out.context = meta.context ?? null; break;
       case "status": out.status = meta.status; break;
       case "result": {
         if (meta.result === undefined || meta.result === null) {
@@ -543,9 +584,6 @@ export interface ReplyHandlerDeps {
   registry?: InterruptRegistry;
 }
 
-/** Continue or fork a terminal job's SDK session, then BLOCKS on the resumed turn.
- *  The reply is a NEW job id continuing the SAME session; cwd/model/agent/tools are
- *  inherited from the source job unless overridden (see SessionStore.reply). */
 export async function handleReply(
   args: Record<string, unknown>,
   extra: ToolHandlerExtra,
@@ -556,21 +594,38 @@ export async function handleReply(
     return { content: { type: "text", text: JSON.stringify(withStructured({ job_id: null, status: "failed" }, "INVALID_ARGUMENT", "job_id is required")) }, isError: true };
   }
   const prompt = String(args.prompt ?? "");
-  if (!prompt) {
+  if (!prompt && args.operation !== "compact") {
     return { content: { type: "text", text: JSON.stringify(withStructured({ job_id: jobId, status: "failed" }, "INVALID_ARGUMENT", "prompt is required")) }, isError: true };
   }
-  const sendProgress = makeMcpProgressSender(extra.sendNotification, extra.progressToken);
-  const started = deps.store.reply(jobId, {
-    prompt,
-    ...toStoreInput(args),
-    sendProgress,
-    progressToken: extra.progressToken,
-    fork: typeof args.fork === "boolean" ? args.fork : false,
-  });
+  const sourceEngine = deps.store.readMeta(jobId)?.engine ?? "claude";
+  if (args.fork === true && !ENGINE_CAPABILITIES[sourceEngine].fork) return {
+    content: { type: "text", text: JSON.stringify(withStructured({ job_id: jobId, status: "failed" }, "UNSUPPORTED_OPERATION", `${sourceEngine} does not expose native session forking through this SDK adapter`)) }, isError: true,
+  };
+  const sendProgress = args.background === true ? undefined : makeMcpProgressSender(extra.sendNotification, extra.progressToken);
+  let started: ReturnType<SessionStore["reply"]>;
+  try {
+    started = deps.store.reply(jobId, {
+      prompt,
+      ...toStoreInput(args),
+      sendProgress,
+      progressToken: extra.progressToken,
+      fork: typeof args.fork === "boolean" ? args.fork : false,
+    });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return { content: { type: "text", text: JSON.stringify(withStructured({ job_id: jobId, status: "failed" }, e instanceof ContextPolicyError ? e.code : "INTERNAL", message)) }, isError: true };
+  }
   if ("status" in started) {
+    if (started.status === "INVALID_ARGUMENT") return {
+      content: { type: "text", text: JSON.stringify(withStructured({ job_id: jobId, status: "failed" }, "INVALID_ARGUMENT", "a session can only be resumed by its original worker engine")) }, isError: true,
+    };
     if (started.status === "SESSION_BUSY") {
       return {
-        content: { type: "text", text: JSON.stringify(withStructured({ job_id: jobId, status: "failed", session_id: started.sessionId }, "SESSION_BUSY", "the job is still running; reply once it reaches a terminal status")) },
+        content: { type: "text", text: JSON.stringify(withStructured({ job_id: jobId, status: "failed", session_id: started.sessionId }, "SESSION_BUSY", started.reason === "storage_fault"
+          ? "the job store could not commit terminal metadata; new work and resumes are blocked until storage is repaired and uncertain records are reconciled"
+          : started.reason === "not_terminal"
+          ? "the job has no confirmed terminal result; automatic recovery of a running record after restart is unavailable"
+          : "the job or another continuation of its session is still running")) },
         isError: true,
       };
     }
@@ -582,29 +637,31 @@ export async function handleReply(
       isError: true,
     };
   }
-  const tracked = trackInterruptableJob(deps.registry, extra.signal, started.jobId, started.interrupt);
-  announceJobId(sendProgress, extra.progressToken, started.jobId);
   try {
-    const result = await deps.store.awaitTerminal(started.jobId);
-    if (!result) {
-      return { content: { type: "text", text: JSON.stringify(withStructured({ job_id: started.jobId, status: "failed" }, "SESSION_NOT_FOUND", "the resumed session could not be loaded")) }, isError: true };
-    }
-    return {
-      content: { type: "text", text: JSON.stringify(toSlimResult(result)) },
-      isError: result.status !== "completed",
-    };
+    return await finishStartedJob(started, deps.store, args.background === true, extra, deps.registry);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return {
       content: { type: "text", text: JSON.stringify({ job_id: started.jobId, status: "failed", error: structured("INTERNAL", msg) }) },
       isError: true,
     };
-  } finally {
-    tracked.cleanup();
   }
 }
 
-/** Ring-buffered event window for a KNOWN job_id. NOT for waiting. */
+export async function handleCompact(
+  args: { job_id: string; instructions?: string; background?: boolean; timeout_ms?: number },
+  extra: ToolHandlerExtra,
+  deps: ReplyHandlerDeps,
+): Promise<{ content: { type: "text"; text: string }; isError?: boolean }> {
+  const meta = deps.store.readMeta(args.job_id);
+  if (!meta) return { content: { type: "text", text: JSON.stringify(withStructured({ job_id: args.job_id, status: "failed" }, "SESSION_NOT_FOUND", "no job with that id")) }, isError: true };
+  const engine = meta.engine ?? "claude";
+  if (!ENGINE_CAPABILITIES[engine].compact) return {
+    content: { type: "text", text: JSON.stringify(withStructured({ job_id: args.job_id, status: "failed" }, "UNSUPPORTED_OPERATION", `${engine} does not expose native compaction through this SDK adapter`)) }, isError: true,
+  };
+  return handleReply({ ...args, prompt: args.instructions ?? "", operation: "compact" }, extra, deps);
+}
+
 export function handleCheck(
   args: { job_id: string; since_cursor?: number },
   store: SessionStore,
@@ -626,7 +683,7 @@ export async function handleSession(
   const root = deps.root ?? transcriptDir();
   switch (args.action) {
     case "list":
-      return handleList({}, {} as never, { root });
+      return handleList({ root });
     case "get": {
       const jobId = String(args.job_id ?? "");
       if (!jobId) return { content: { type: "text", text: JSON.stringify(withStructured({}, "INVALID_ARGUMENT", "job_id is required for get")) }, isError: true };
@@ -637,6 +694,7 @@ export async function handleSession(
       if (!jobId) return { content: { type: "text", text: JSON.stringify(withStructured({}, "INVALID_ARGUMENT", "job_id is required for cancel")) }, isError: true };
       const res = await deps.store.cancel(jobId, "cancelled via cx_agent_session");
       if (res.status === "not_found") return { content: { type: "text", text: JSON.stringify(withStructured({ job_id: jobId, status: "not_found" }, "SESSION_NOT_FOUND", "no live job with that id")) }, isError: true };
+      if (res.status === "failed") return { content: { type: "text", text: JSON.stringify(withStructured({ job_id: jobId, status: "failed" }, "INTERNAL", res.error)) }, isError: true };
       return { content: { type: "text", text: JSON.stringify({ job_id: jobId, status: "cancelled", error: structured("CANCELLED", "terminal cancel; the job is not resumable") }) } };
     }
     case "clean": {
@@ -661,6 +719,7 @@ export async function handleSession(
           seen.push(jobId);
           if (dryRun) continue;
           removeJobFiles(root, jobId);
+          deps.store.forget(jobId);
           removed.push(jobId);
         }
       }
@@ -683,22 +742,27 @@ export interface SetupResult {
   model: string | null;
   models: string[];
   diagnostics: string[];
+  engine?: EngineName;
+  capabilities?: (typeof ENGINE_CAPABILITIES)[EngineName];
+  context?: ContextPolicy | null;
 }
 
 export async function handleSetup(
   poolName?: string,
-  opts: { provider?: ModelProvider } = {},
+  opts: { provider?: ModelProvider; engine?: string } = {},
 ): Promise<{ content: { type: "text"; text: string }; isError?: boolean }> {
   const settings = loadSettings();
   const model = poolName ?? settings.pool;
   const diagnostics: string[] = [];
   let catalog: Catalog;
+  let engine: EngineName | undefined;
   try {
+    engine = resolveEngine(opts.engine);
     const provider = opts.provider ?? resolveProvider();
     catalog = await provider.discover(model);
   } catch (e) {
     diagnostics.push(e instanceof Error ? e.message : String(e));
-    return setupPayload(false, model ?? null, [], diagnostics);
+    return setupPayload(false, model ?? null, [], diagnostics, true, engine);
   }
   diagnostics.push(...catalog.diagnostics);
   if (!model || model.length === 0) {
@@ -707,12 +771,12 @@ export async function handleSetup(
     diagnostics.push(`unknown model "${model}"; valid models: ${catalog.models.join(", ")}`);
   }
   const ready = catalog.ready && !!model && (catalog.models.length === 0 || catalog.models.includes(model));
-  return setupPayload(ready, model ?? null, catalog.models, diagnostics, !ready);
+  return setupPayload(ready, model ?? null, catalog.models, diagnostics, !ready, engine);
 }
 
 function setupPayload(
-  ready: boolean, model: string | null, models: string[], diagnostics: string[], isError = true,
+  ready: boolean, model: string | null, models: string[], diagnostics: string[], isError = true, engine?: EngineName,
 ): { content: { type: "text"; text: string }; isError?: boolean } {
-  const payload: SetupResult = { ready, model, models, diagnostics };
+  const payload: SetupResult = { ready, model, models, diagnostics, ...(engine ? { engine, capabilities: ENGINE_CAPABILITIES[engine], context: resolveContextPolicy(engine) ?? null } : {}) };
   return { content: { type: "text", text: JSON.stringify(payload) }, isError };
 }

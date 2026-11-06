@@ -4,7 +4,7 @@ import { defineConfig } from "tsup";
 export default defineConfig({
   entry: ["src/index.ts"],
   format: ["esm"],
-  target: "node18",
+  target: "node22",
   platform: "node",
   outDir: "dist",
   // tsup preserves src/index.ts's shebang; do not add a duplicate banner.

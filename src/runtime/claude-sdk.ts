@@ -124,6 +124,8 @@ export function buildWorkerEnv(
 const SELF_TOOLS = [
   "cx_agent_run", "cx_agent_reply", "cx_agent_check", "cx_agent_fetch",
   "cx_agent_interrupt", "cx_agent_session", "cx_agent_setup", "cx_agent_list",
+  "cx_agent_wait",
+  "cx_agent_compact",
 ] as const;
 
 export const WORKER_DISALLOWED_TOOLS: string[] = [

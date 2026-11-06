@@ -7,9 +7,9 @@ import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import {
   handleRun, handleList, handleFetchJob, handleInterrupt,
-  handleReply, handleCheck, handleSession, handleSetup,
+  handleReply, handleCheck, handleSession, handleSetup, handleWait, handleCompact,
   runInputSchema, fetchInputSchema, interruptInputSchema,
-  replyInputSchema, checkInputSchema, sessionInputSchema, setupInputSchema,
+  replyInputSchema, checkInputSchema, sessionInputSchema, setupInputSchema, waitInputSchema, compactInputSchema,
   type InterruptRegistry, type ReplyHandlerDeps,
 } from "./tools.js";
 import { runWorker } from "./worker.js";
@@ -45,8 +45,9 @@ export function createServer(opts: ServerOptions = {}): {
     "cx_agent_run",
     {
       description:
-        "Delegate a task to a worker model behind the configured gateway. BLOCKS until terminal; do NOT poll. At ~2 min the call " +
-        "auto-backgrounds and the terminal result arrives as a task notification with no second tool call. The worker is " +
+        "Delegate a task to a worker. Use background:true to return {job_id,status:running} immediately, " +
+        "then cx_agent_wait for bounded completion checks while other work continues. Without background:true the call " +
+        "blocks until terminal; client backgrounding and notifications depend on the client. The worker is " +
         "isolated from this conversation. Completed jobs return ONLY {job_id, result}; non-completed jobs return " +
         "{job_id, status, error, resumable} where error is a typed {code, message}. A job that runs out of budget " +
         "(max_turns, max_budget_usd or timeout_ms) ends as status `incomplete` with resumable:true — the work so far is " +
@@ -69,16 +70,41 @@ export function createServer(opts: ServerOptions = {}): {
   );
 
   server.registerTool(
+    "cx_agent_wait",
+    {
+      description: "Retrieve a background job result, waiting at most timeout_ms (default 1000, maximum 30000). Returns {job_id,status:running} when still working, or the terminal run envelope. Wait timeout and request cancellation do not cancel the worker. Jobs require this server process to remain alive.",
+      inputSchema: waitInputSchema,
+    },
+    async (args, extra) => {
+      const out = await handleWait(args, store, extra.signal);
+      return { content: [{ type: "text" as const, text: out.content.text }], isError: out.isError };
+    },
+  );
+
+  server.registerTool(
+    "cx_agent_compact",
+    {
+      description: "Compact a terminal job's native session using its SDK. Currently supported by Pi. Accepts optional instructions, timeout_ms and background:true. Creates a new job on the same session and uses the same session lock as reply. Unsupported engines return UNSUPPORTED_OPERATION.",
+      inputSchema: compactInputSchema,
+    },
+    async (args, extra) => {
+      const progressToken = (extra._meta as { progressToken?: string | number } | undefined)?.progressToken;
+      const out = await handleCompact(args, { progressToken, sendNotification: extra.sendNotification as (n: unknown) => Promise<void>, signal: extra.signal }, { store, registry });
+      return { content: [{ type: "text" as const, text: out.content.text }], isError: out.isError };
+    },
+  );
+
+  server.registerTool(
     "cx_agent_list",
     {
       description:
         "List recent cx-agent jobs from their .meta.json sidecars. This is an operator convenience for " +
         "INSPECTION ONLY — it does NOT wait, does NOT return the result of a running job, and is NOT a polling tool. " +
-        "Do not call this to wait on a job; cx_agent_run BLOCKS and returns the result itself. Returns one line per job.",
+        "Use cx_agent_wait to collect a background job result. Returns one line per job.",
       inputSchema: {},
     },
     async () => {
-      const out = handleList({}, {} as never, { root: transcriptDir() });
+      const out = handleList({ root: transcriptDir() });
       return { content: [{ type: "text" as const, text: out.content.text }] };
     },
   );
@@ -107,13 +133,13 @@ export function createServer(opts: ServerOptions = {}): {
       description:
         "Continue or fork ANY terminal cx-agent job that holds a session — completed, incomplete (max_turns / " +
         "max_budget_usd / timeout) or interrupted — by resuming its SDK session with a new prompt. This is the recovery " +
-        "path for a job killed by its budget: the worker picks up where it stopped rather than restarting. BLOCKS until " +
-        "the resumed turn is terminal; the result arrives as a task notification, same as cx_agent_run. The reply gets a " +
+        "path for a job killed by its budget: the worker picks up where it stopped rather than restarting. Use background:true " +
+        "to return immediately, then cx_agent_wait for the result. Otherwise blocks until terminal. The reply gets a " +
         "NEW job_id continuing the SAME session. cwd, model, agent, tool menu and reasoning config (thinking/effort) are " +
         "INHERITED from the source job (SDK sessions are stored per-cwd, so a resume elsewhere would not find them); " +
         "budget is NOT inherited, so the reply starts with a fresh full allowance. " +
         "fork:true branches to a NEW session id (original untouched). Rejects " +
-        "with SESSION_BUSY while the job is still running and SESSION_NOT_FOUND if the job is unknown or never " +
+        "with SESSION_BUSY while the job or another continuation of its session is still running and SESSION_NOT_FOUND if the job is unknown or never " +
         "recorded a session.",
       inputSchema: replyInputSchema,
     },
@@ -133,7 +159,7 @@ export function createServer(opts: ServerOptions = {}): {
     {
       description:
         "Inspect ring-buffered events for a KNOWN job_id since a cursor — { status, events[], nextCursor, terminal }. " +
-        "This is NOT for waiting on completion; cx_agent_run/reply BLOCK and push the terminal result. A settled whose " +
+        "Use cx_agent_wait to collect completion. A settled job whose " +
         "live record detached returns its terminal status with events:[]. Use it for resumed/external jobs the main " +
         "agent already has an id for; never poll with it.",
       inputSchema: checkInputSchema,
@@ -166,13 +192,13 @@ export function createServer(opts: ServerOptions = {}): {
     "cx_agent_setup",
     {
       description:
-        "Check endpoint readiness before delegating. Returns { ready, model, models, diagnostics }. " +
-        "When not ready, diagnostics name the fix (CX_AGENT_BASE_URL/CX_AGENT_API_KEY missing, gateway unreachable, or unknown model). " +
-        "Thin wrapper over the same pre-flight the worker itself runs at job start. Takes no input.",
+        "Check endpoint readiness before delegating. Returns { ready, engine, capabilities, model, models, diagnostics }. " +
+        "Reports the selected SDK adapter capabilities and checks gateway configuration. Optional engine and model override defaults. " +
+        "Configured endpoints and models still require a live run to validate protocol compatibility.",
       inputSchema: setupInputSchema,
     },
-    async () => {
-      const out = await handleSetup();
+    async (args) => {
+      const out = await handleSetup(args.model, { engine: args.engine });
       return { content: [{ type: "text" as const, text: out.content.text }], isError: out.isError };
     },
   );
@@ -181,8 +207,8 @@ export function createServer(opts: ServerOptions = {}): {
     "cx_agent_interrupt",
     {
       description:
-        "Interrupt a running cx-agent job by job_id. Kills the worker process tree and resolves the pending " +
-        "cx_agent_run call as status=interrupted. The job stays RESUMABLE via cx_agent_reply (its session_id is " +
+        "Interrupt a running cx-agent job by job_id. Kills the worker process tree and settles the job " +
+        "as status=interrupted. The job stays RESUMABLE via cx_agent_reply when a native session was recorded (its session_id is " +
         "retained). For a terminal, non-resumable stop use cx_agent_session cancel. Returns status interrupted or " +
         "not_found (SESSION_NOT_FOUND typed error). The job_id of an in-flight job is announced on the progress " +
         "channel as \"job <id> started\" as soon as it launches.",

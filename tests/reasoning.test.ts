@@ -269,7 +269,9 @@ describe("SessionStore — reasoning plumbing", () => {
       session_id: "s-src", thinking: { type: "adaptive", display: "summarized" }, effort: "high",
     } satisfies JobMeta));
 
-    store.reply("src-job", { prompt: "keep going" });
+    const first = store.reply("src-job", { prompt: "keep going" });
+    if ("status" in first) throw new Error(first.status);
+    await store.awaitTerminal(first.jobId);
     expect(seen[0].thinking).toEqual({ type: "adaptive", display: "summarized" });
     expect(seen[0].effort).toBe("high");
 
